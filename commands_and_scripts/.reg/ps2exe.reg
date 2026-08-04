@@ -1,0 +1,22 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================
+; PS2EXE context menu for .ps1 files
+; Output: same folder, same base name, .exe extension
+; ============================================================
+
+; ---- Compile to EXE (console) ----
+[HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\.ps1\shell\ps2exe_compile_console]
+@="Compile to EXE (console)"
+"Icon"="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+
+[HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\.ps1\shell\ps2exe_compile_console\command]
+@="powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command \"Import-Module PS2EXE; $in='%1'; $out=[System.IO.Path]::ChangeExtension($in,'.exe'); Invoke-PS2EXE -inputFile $in -outputFile $out\""
+
+; ---- Compile to EXE (no console window) ----
+[HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\.ps1\shell\ps2exe_compile_noconsole]
+@="Compile to EXE (no console)"
+"Icon"="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+
+[HKEY_CURRENT_USER\Software\Classes\SystemFileAssociations\.ps1\shell\ps2exe_compile_noconsole\command]
+@="powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command \"Import-Module PS2EXE; $in='%1'; $out=[System.IO.Path]::ChangeExtension($in,'.exe'); Invoke-PS2EXE -inputFile $in -outputFile $out -noConsole\""

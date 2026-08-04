@@ -1,0 +1,2 @@
+schtasks /delete /tn "<task name>" /f
+schtasks /delete /tn "Avast Software" /f

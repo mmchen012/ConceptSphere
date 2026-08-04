@@ -1,0 +1,4 @@
+Get-AppxPackage -AllUsers *XboxGamingOverlay* | Remove-AppxPackage
+Get-AppxPackage -AllUsers *Microsoft.GetHelp* | Remove-AppxPackage
+Get-AppxPackage -AllUsers *YourPhone* | Remove-AppxPackage
+Get-AppxPackage -AllUsers *PhoneLink* | Remove-AppxPackage

@@ -1,0 +1,120 @@
+﻿<?xml version="1.0" encoding="UTF-8" ?>
+<mf_config mfver="6.1.520 (x64)" sysname="EVA-2" winver="10.0.26100  (x64)">
+   <global_options>
+      <options>hideTaskbarIcon</options>
+      <logdays>15</logdays>
+      <taskPriority>normal</taskPriority>
+      <maxLogCount>500</maxLogCount>
+      <hotKey>Ctrl+Alt+M</hotKey>
+      <langFile>english.lng</langFile>
+      <remote_server>
+         <bindAddr>None</bindAddr>
+         <port>41414</port>
+         <password obfuscated="yes" />
+      </remote_server>
+   </global_options>
+   <excluded_files>
+      <file>
+         <path incSub="yes">C:\Windows\temp</path>
+         <fileType>*.*</fileType>
+      </file>
+      <file>
+         <path incSub="yes">C:\Users\*\AppData\Local\Temp</path>
+         <fileType>*.*</fileType>
+      </file>
+      <file>
+         <path incSub="yes">C:\Users\*\AppData\Local\Microsoft\Windows\Temporary Internet Files</path>
+         <fileType>*.*</fileType>
+      </file>
+   </excluded_files>
+   <storage_list>
+      <storage_info id="1" type="drive">
+         <hostName fsName="NTFS" volId="0x30c2836a">C:</hostName>
+         <label>ATOM-9_OS</label>
+      </storage_info>
+      <storage_info id="2" type="drive">
+         <hostName fsName="NTFS" volId="0xf6497cd5">D:</hostName>
+         <label>ATOM-9_DATA</label>
+      </storage_info>
+      <storage_info id="3" type="wnet">
+         <hostName fsName="9P">\\wsl.localhost\Ubuntu-24.04</hostName>
+      </storage_info>
+      <storage_info id="4" type="drive">
+         <hostName fsName="NTFS" volId="0x82730a38">Z:</hostName>
+         <label>ATOM-10</label>
+      </storage_info>
+   </storage_list>
+   <mirror_list>
+      <mirror_info>
+         <src_path storId="2">Dropbox\Private\ConceptSphere</src_path>
+         <mirror_path storId="2">Dropbox\Private\.mirrors\ConceptSphere</mirror_path>
+         <arcvBaseName>ConceptSphere</arcvBaseName>
+         <arcvFormat>7z</arcvFormat>
+         <optFlags>opSyncPeriodic opSyncIndependently opSyncMultiThread opDelUnmatch opKeepSnapshot opIncSubAll opExcludeLinks</optFlags>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+         <snapshotCount>3</snapshotCount>
+      </mirror_info>
+      <mirror_info>
+         <src_path storId="2">Dropbox\Private\Documents</src_path>
+         <mirror_path storId="2">Dropbox\Private\.mirrors\Documents</mirror_path>
+         <arcvBaseName>Documents</arcvBaseName>
+         <arcvFormat>7z</arcvFormat>
+         <optFlags>opSyncPeriodic opSyncIndependently opSyncMultiThread opDelUnmatch opKeepSnapshot opIncSubAll opExcludeLinks</optFlags>
+         <extList>{"file":"desktop.ini"}</extList>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+         <snapshotCount>3</snapshotCount>
+      </mirror_info>
+      <mirror_info>
+         <src_path storId="1">Users\michael\.ssh</src_path>
+         <mirror_path storId="2">Dropbox\Private\.mirrors\.ssh</mirror_path>
+         <arcvBaseName>.ssh</arcvBaseName>
+         <arcvFormat>7z</arcvFormat>
+         <optFlags>opSyncPeriodic opSyncIndependently opSyncMultiThread opDelUnmatch opKeepSnapshot opIncSubAll opExcludeLinks</optFlags>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+         <snapshotCount>3</snapshotCount>
+      </mirror_info>
+      <mirror_info>
+         <src_path storId="1">Users\michael\AppData\Roaming\foobar2000-v2</src_path>
+         <mirror_path storId="2">Dropbox\Private\.mirrors\foobar2000-v2</mirror_path>
+         <arcvBaseName>foobar2000-v2</arcvBaseName>
+         <arcvFormat>7z</arcvFormat>
+         <optFlags>opSyncPeriodic opSyncIndependently opSyncMultiThread opDelUnmatch opKeepSnapshot opIncSubAll opExcludeLinks</optFlags>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+         <snapshotCount>3</snapshotCount>
+      </mirror_info>
+      <mirror_info>
+         <src_path storId="1">Users\michael\AppData\Roaming\nvda</src_path>
+         <mirror_path storId="2">Dropbox\Private\.mirrors\nvda</mirror_path>
+         <arcvBaseName>nvda</arcvBaseName>
+         <arcvFormat>7z</arcvFormat>
+         <optFlags>opSyncPeriodic opSyncIndependently opSyncMultiThread opDelUnmatch opKeepSnapshot opIncSubAll opExcludeLinks</optFlags>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+         <snapshotCount>3</snapshotCount>
+      </mirror_info>
+      <mirror_info>
+         <src_path storId="2">Dropbox\Private\Music</src_path>
+         <mirror_path storId="2">Dropbox\Private\.mirrors\Music</mirror_path>
+         <arcvBaseName>Music</arcvBaseName>
+         <arcvFormat>7z</arcvFormat>
+         <optFlags>opSyncPeriodic opSyncIndependently opSyncMultiThread opDelUnmatch opKeepSnapshot opIncSubAll opExcludeLinks</optFlags>
+         <subList>{"path":"AIFF\iTunes Media"},{"path":"Books"},{"path":"iTunes"}</subList>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+         <snapshotCount>3</snapshotCount>
+      </mirror_info>
+      <mirror_info>
+         <src_path storId="3">home\accuser2</src_path>
+         <mirror_path storId="2">Accton\.mirrors\accuser2</mirror_path>
+         <arcvBaseName>accuser2</arcvBaseName>
+         <arcvFormat>7z</arcvFormat>
+         <optFlags>opSyncPeriodic opAccountUser opSyncIndependently opSyncMultiThread opDelUnmatch opKeepSnapshot opIncSubAll opExcludeLinks</optFlags>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+         <snapshotCount>3</snapshotCount>
+      </mirror_info>
+      <mirror_info>
+         <src_path storId="2">Dropbox\Private\Profiles</src_path>
+         <mirror_path storId="4">\</mirror_path>
+         <optFlags>opSyncPeriodic opSyncIndependently opSyncMultiThread opDelUnmatch opIncSubAll opExcludeLinks</optFlags>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+      </mirror_info>
+   </mirror_list>
+</mf_config>

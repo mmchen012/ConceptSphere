@@ -1,0 +1,22 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\SOFTWARE\Policies\Microsoft\Edge]
+"NewTabPageLocation"="https://www.chatgpt.com/"
+"NewTabPageOverrideEnabled"=dword:00000001
+"NewTabPageSetFeedType"=dword:00000000
+"NewTabPageAllowedBackgroundTypes"=dword:00000000
+
+"HomepageLocation"="https://www.chatgpt.com/"
+"HomepageIsNewTabPage"=dword:00000000
+"RestoreOnStartup"=dword:00000004
+
+[HKEY_CURRENT_USER\SOFTWARE\Policies\Microsoft\Edge\RestoreOnStartupURLs]
+"1"="https://www.chatgpt.com/"
+
+; ====== DISABLE ALL POLICIES THAT BLOCK CUSTOM NEW TAB PAGE ======
+"NewTabPageForOfficeEnabled"=dword:00000000
+"OfficeFeedEnabled"=dword:00000000
+"MicrosoftNewTabPageDefault"=dword:00000000
+"AllowCopilotInMicrosoftEdge"=dword:00000000
+"CopilotPageEnabled"=dword:00000000
+"CopilotCDPEnabled"=dword:00000000

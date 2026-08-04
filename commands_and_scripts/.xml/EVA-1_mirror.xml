@@ -1,0 +1,62 @@
+﻿<?xml version="1.0" encoding="UTF-8" ?>
+<mf_config mfver="6.0.508 (x64)" sysname="EVA-1" winver="6.2.9200  (x64)">
+   <global_options>
+      <options />
+      <logdays>15</logdays>
+      <taskPriority>normal</taskPriority>
+      <maxLogCount>500</maxLogCount>
+      <hotKey>Ctrl+Alt+M</hotKey>
+      <langFile>english.lng</langFile>
+      <remote_server>
+         <bindAddr>None</bindAddr>
+         <port>41414</port>
+         <password obfuscated="yes" />
+      </remote_server>
+   </global_options>
+   <excluded_files>
+      <file>
+         <path incSub="yes">C:\WINDOWS\temp</path>
+         <fileType>*.*</fileType>
+      </file>
+      <file>
+         <path incSub="yes">C:\Users\*\AppData\Local\Temp</path>
+         <fileType>*.*</fileType>
+      </file>
+      <file>
+         <path incSub="yes">C:\Users\*\AppData\Local\Microsoft\Windows\Temporary Internet Files</path>
+         <fileType>*.*</fileType>
+      </file>
+   </excluded_files>
+   <storage_list>
+      <storage_info id="1" type="drive">
+         <hostName fsName="NTFS" volId="0x985b7616">D:</hostName>
+         <label>ATOM-4_DATA</label>
+      </storage_info>
+      <storage_info id="2" type="drive">
+         <hostName fsName="NTFS" volId="0x7c01aeab">C:</hostName>
+         <label>ATOM-4_OS</label>
+      </storage_info>
+   </storage_list>
+   <mirror_list>
+      <mirror_info>
+         <src_path storId="1">Virtual_Machines</src_path>
+         <mirror_path storId="1">Dropbox\Public\Virtual_Machines</mirror_path>
+         <arcvBaseName>Virtual_Machines</arcvBaseName>
+         <arcvFormat>7z</arcvFormat>
+         <optFlags>opSyncPeriodic opSyncIndependently opSyncMultiThread opDelUnmatch opKeepSnapshot opIncSubAll opExcludeLinks</optFlags>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+         <snapshotCount>1</snapshotCount>
+      </mirror_info>
+      <mirror_info>
+         <src_path storId="1">Profiles</src_path>
+         <mirror_path storId="1">Dropbox\Private\Profiles</mirror_path>
+         <optFlags>opSyncInstant opSyncIndependently opSyncMultiThread opSyncBidirectional opIncSubAll opExcludeLinks</optFlags>
+      </mirror_info>
+      <mirror_info>
+         <src_path storId="1">Dropbox\Private\.mirrors\FortiClient</src_path>
+         <mirror_path storId="2">Users\michael\AppData\Roaming\FortiClient</mirror_path>
+         <optFlags>opSyncPeriodic opSyncIndependently opSyncMultiThread opIncSubAll opExcludeLinks</optFlags>
+         <syncTimeInterval timeUnit="day">1</syncTimeInterval>
+      </mirror_info>
+   </mirror_list>
+</mf_config>

@@ -1,0 +1,1 @@
+wsl -e bash -lic "sudo curl -sO https://atlas.accton.com:8443/jnlpJars/agent.jar; sudo java -jar agent.jar -url https://atlas.accton.com:8443/ -secret a1df3763a1740c22e1884dca86eda24571060bdcd8eeb8b50a3bbdb61759b95b -name \"Taipei_Michael_EVA-1_Linux\" -workDir \"/mnt/d/Accton/Jenkins/EVA-1_Linux\"; exec bash"

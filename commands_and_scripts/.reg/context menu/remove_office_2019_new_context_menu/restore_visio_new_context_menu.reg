@@ -1,0 +1,32 @@
+Windows Registry Editor Version 5.00
+
+; Restores "Microsoft Visio Drawing" to the Windows New context menu.
+; This re-creates the common ShellNew registrations used by Visio 2013/2016/2019/2021/Microsoft 365.
+; Import this file, then restart Windows Explorer or sign out and back in.
+
+[HKEY_CURRENT_USER\Software\Classes\.vsdx\Visio.Drawing.15\ShellNew]
+"NullFile"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.vsdm\Visio.DrawingMacroEnabled.15\ShellNew]
+"NullFile"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.vsd\Visio.Drawing.11\ShellNew]
+"NullFile"=""
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Classes\.vsdx\Visio.Drawing.15\ShellNew]
+"NullFile"=""
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Classes\.vsdm\Visio.DrawingMacroEnabled.15\ShellNew]
+"NullFile"=""
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Classes\.vsd\Visio.Drawing.11\ShellNew]
+"NullFile"=""
+
+[HKEY_CLASSES_ROOT\.vsdx\Visio.Drawing.15\ShellNew]
+"NullFile"=""
+
+[HKEY_CLASSES_ROOT\.vsdm\Visio.DrawingMacroEnabled.15\ShellNew]
+"NullFile"=""
+
+[HKEY_CLASSES_ROOT\.vsd\Visio.Drawing.11\ShellNew]
+"NullFile"=""

@@ -1,0 +1,25 @@
+Windows Registry Editor Version 5.00
+
+; --- Remove TargetReleaseVersion blocking feature updates ---
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate]
+"TargetReleaseVersion"=-
+"TargetReleaseVersionInfo"=-
+"ProductVersion"=-
+"DisableOSUpgrade"=-
+"DeferFeatureUpdates"=-
+"DeferQualityUpdates"=-
+"DeferFeatureUpdatesPeriodInDays"=-
+"DeferQualityUpdatesPeriodInDays"=-
+"BranchReadinessLevel"=-
+"Paused"=-
+
+; --- Remove equivalent keys in HKCU just in case ---
+[HKEY_CURRENT_USER\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate]
+"TargetReleaseVersion"=-
+"TargetReleaseVersionInfo"=-
+"ProductVersion"=-
+
+; --- Remove Feature Deferral from standard WU settings ---
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings]
+"FlightSettingsMaxBranchAgeInDays"=-
+"DeferFeatureUpdatesPeriodInDays"=-

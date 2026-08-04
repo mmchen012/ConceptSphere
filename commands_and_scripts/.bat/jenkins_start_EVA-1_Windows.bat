@@ -1,0 +1,2 @@
+cd D:\Accton\Jenkins
+curl.exe -sO https://atlas.accton.com:8443/jnlpJars/agent.jar & java -jar agent.jar -url https://atlas.accton.com:8443/ -secret 802709e3b4ee9e5ac70ccd2b983b650958f59a813d980aa395cbd96fbaf6074b -name "Taipei_Michael_EVA-1_Windows" -workDir "D:/Accton/jenkins/EVA-1_Windows"

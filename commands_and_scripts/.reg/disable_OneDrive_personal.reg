@@ -1,0 +1,8 @@
+Windows Registry Editor Version 5.00
+
+; Disable OneDrive Personal for current user
+; Keeps OneDrive Work/School functional
+
+[HKEY_CURRENT_USER\Software\Policies\Microsoft\OneDrive]
+"DisablePersonalSync"=dword:00000001
+"DisableNewAccountDetection"=dword:00000001

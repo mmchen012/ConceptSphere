@@ -1,0 +1,5 @@
+# Set PowerShell as default for .ps1 files
+cmd /c assoc .ps1=Microsoft.PowerShellScript.1
+
+# Set the default action to "Run with PowerShell"
+cmd /c ftype Microsoft.PowerShellScript.1="%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -ExecutionPolicy Bypass -File "%1" %*

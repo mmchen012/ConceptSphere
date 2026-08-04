@@ -1,0 +1,27 @@
+Windows Registry Editor Version 5.00
+
+; Set the default open command for PowerShell scripts to Notepad++
+[HKEY_CLASSES_ROOT\Microsoft.PowerShellScript.1\Shell\Open\Command]
+@="\"C:\\Program Files\\Notepad++\\notepad++.exe\" \"%1\""
+
+; 1. Target the System-Wide File Association (Higher priority)
+[HKEY_CLASSES_ROOT\SystemFileAssociations\.ps1\shell\open\command]
+@="\"C:\\Program Files\\Notepad++\\notepad++.exe\" \"%1\""
+
+; 2. Target the standard PowerShell Class (Fallback)
+[HKEY_CLASSES_ROOT\Microsoft.PowerShellScript.1\Shell\Open\Command]
+@="\"C:\\Program Files\\Notepad++\\notepad++.exe\" \"%1\""
+
+; 3. Clear the User Choice "Lock" (Force Windows to look at the keys above)
+[-HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.ps1\UserChoice]
+
+; 4. Set the Progid in the background to point to our desired class
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.ps1\OpenWithProgids]
+"Microsoft.PowerShellScript.1"=hex(0):
+
+; --- Add explicit context menu item "Edit with Notepad++" ---
+[HKEY_CLASSES_ROOT\SystemFileAssociations\.ps1\shell\EditWithNotepadPP]
+@="Edit with Notepad++"
+
+[HKEY_CLASSES_ROOT\SystemFileAssociations\.ps1\shell\EditWithNotepadPP\command]
+@="\"C:\\Program Files\\Notepad++\\notepad++.exe\" \"%1\""

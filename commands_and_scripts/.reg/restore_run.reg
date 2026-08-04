@@ -1,0 +1,5 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Run]
+"OneDrive"="\"C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe\" /background"
+"MSTeams"="\"C:\\Program Files\\WindowsApps\\MSTeams_26005.204.4249.1621_x64__8wekyb3d8bbwe\\ms-teams.exe\""
