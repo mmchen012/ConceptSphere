@@ -1,0 +1,2 @@
+$key = (Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager' | Where-Object PSChildName -like 'OneDrive!*Business1*' | Select-Object -First 1).PSPath
+1..20 | ForEach-Object { "{0}: {1}" -f (Get-Date -Format 'HH:mm:ss'), (Get-ItemProperty -LiteralPath $key -Name DisplayNameResource -EA 0).DisplayNameResource; Start-Sleep 1 }

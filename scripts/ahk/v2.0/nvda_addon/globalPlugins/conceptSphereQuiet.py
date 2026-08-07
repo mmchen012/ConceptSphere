@@ -163,7 +163,6 @@ MENU_ANNOUNCE_DELAY_MS = 80
 HIDE_FINAL_ANNOUNCE_DELAY_MS = 120
 RESTORE_FINAL_PREPARE_DELAY_MS = 40
 RESTORE_FINAL_ANNOUNCE_DELAY_MS = 120
-RESTORE_TITLE_FOCUS_PAUSE_MS = 350
 RESTORE_TITLE_MIN_MS = 650
 RESTORE_TITLE_MAX_MS = 3200
 RESTORE_FOCUS_MIN_MS = 650
@@ -184,38 +183,30 @@ MINITRAY_QUEUE_PUNCT_MS = 90
 MINITRAY_QUEUE_LIMIT = 32
 
 # Native Alt+Tab first reports the selected task-switcher item, usually as
-# "<title>, row <n>, column <n>". Capture that title but keep the first 150 ms
-# silent while watching Alt. A quick release speaks one combined
-# "<title>: <focus>" utterance. If Alt remains held through 150 ms, speak
-# the plain title, wait for its estimated completion, and report focus only
-# after Alt is released. Native release-time duplicates are suppressed.
+# "<title>, row <n>, column <n>". When Alt is released, NVDA normally cancels
+# that preview and starts a second foreground-window utterance. Replace the
+# preview with "<full title>, window", make it independent of the task-switcher
+# focus object, and suppress the release-time cancellation/duplicate.
 ALT_TAB_PREVIEW_WAIT_MS = 1600
 ALT_TAB_SESSION_MAX_MS = 12000
-# Alt+Tab and ordinary foreground-window openings use a deliberately tight
-# title-duration estimate. The 150 ms decision applies only to Alt+Tab; ordinary
-# foreground-window openings keep their existing immediate title behavior.
-ALT_TAB_QUICK_RELEASE_MS = 150
-ALT_TAB_TITLE_FOCUS_DELAY_MS = 20
-ALT_TAB_RELEASE_POLL_MS = 10
-ALT_TAB_TITLE_MIN_MS = 300
-ALT_TAB_TITLE_MAX_MS = 2200
-ALT_TAB_TITLE_WORD_MS = 135
-ALT_TAB_TITLE_CHAR_MS = 15
-ALT_TAB_TITLE_PUNCT_MS = 35
-ALT_TAB_TITLE_STARTUP_MS = 70
+ALT_TAB_TITLE_FOCUS_DELAY_MS = 50
+ALT_TAB_RELEASE_POLL_MS = 25
+ALT_TAB_TITLE_MIN_MS = 650
+ALT_TAB_TITLE_MAX_MS = 3200
 ALT_TAB_FOCUS_RETRY_MS = 80
 ALT_TAB_FOCUS_MAX_ATTEMPTS = 12
 ALT_TAB_POST_FOCUS_GUARD_MS = 600
 
 # Newly opened windows and windows revealed because the previous foreground
-# window closed use the same low-latency deterministic sequence as Alt+Tab:
-# plain title -> short fixed gap -> current focused control. Unlike Alt+Tab,
-# these transitions do not wait for Alt-up. Native transition chatter is
-# suppressed during the sequence and briefly after the custom focus report.
+# window closed use the same deterministic sequence as Alt+Tab:
+# plain title -> fixed 50 ms gap -> current focused control.
+# Native transition chatter is suppressed during the sequence and briefly
+# after the custom focus report.
 NEW_FOREGROUND_WATCH_MS = 900
 NEW_FOREGROUND_FOCUS_RETRY_MS = 60
 NEW_FOREGROUND_FOCUS_MAX_ATTEMPTS = 12
 FOREGROUND_POST_FOCUS_GUARD_MS = 600
+
 CLOSE_REVEAL_PROBE_DELAY_MS = 70
 CLOSE_REVEAL_PROBE_RETRY_MS = 60
 CLOSE_REVEAL_PROBE_MAX_ATTEMPTS = 10
@@ -311,12 +302,6 @@ NATIVE_SPEECH_CLASSES = {
     "windows.ui.composition.desktopwindowcontentbridge",
     "xamlexplorerhostislandwindow",
     "workerw",
-
-    # VAIO service/startup phantom windows are handled outside the ordinary
-    # title-then-focus path. Never treat them as newly opened applications.
-    "veskeyboardbacklightobjectwnd",
-    "vaiocontrolcenterstartupformwindow",
-    "vvccstartupformwindow",
 }
 
 NATIVE_SPEECH_APPS = {
@@ -376,12 +361,8 @@ _alt_tab_preview_wait_until = 0.0
 _alt_tab_session_until = 0.0
 _alt_tab_title_guard_until = 0.0
 _alt_tab_release_seen_at = 0.0
-_alt_tab_quick_release_deadline = 0.0
 _alt_tab_focus_generation = 0
 _alt_tab_focus_pending = False
-_alt_tab_current_title = ""
-_alt_tab_title_spoken = False
-_alt_tab_quick_release_mode = False
 _alt_tab_post_focus_until = 0.0
 _alt_tab_post_focus_hwnd = 0
 
@@ -399,10 +380,21 @@ _new_foreground_watch = None
 _foreground_post_focus_until = 0.0
 _foreground_post_focus_hwnd = 0
 _close_reveal_probe_generation = 0
-
+_close_reveal_probe_state = None
+_last_close_gesture_hwnd = 0
+_last_close_gesture_at = 0.0
 _saved_focus_objects = {}
 _recovered_terminal_objects = {}
 _recovered_generic_focus_objects = {}
+
+# explorerNav's dead-frame redirect is useful only when the corresponding
+# Explorer CabinetWClass is actually foreground. A delayed Explorer gainFocus
+# event must never be allowed to pull focus away from whatever window Windows
+# has since made foreground (dialog or otherwise).
+_explorer_stale_focus_guard_module = None
+_explorer_stale_focus_guard_class = None
+_explorer_stale_focus_guard_original = None
+_explorer_stale_focus_guard_wrapper = None
 
 # Desktop-churn state. A serial is used instead of a time threshold: one
 # name-only announcement is allowed for each real user gesture, while any
@@ -1366,30 +1358,6 @@ def _estimate_title_speech_ms(text):
     return max(RESTORE_TITLE_MIN_MS, min(estimate, RESTORE_TITLE_MAX_MS))
 
 
-def _estimate_fast_transition_title_speech_ms(text):
-    """Estimate title completion for Alt+Tab and foreground app transitions.
-
-    This intentionally uses a lower floor and smaller per-word/character costs
-    than restore/MiniTray announcements. Alt+Tab separately polls Alt state, so
-    focused-control speech still remains pending if Alt is held after the title.
-    Ordinary window openings use the same estimate without the Alt-up wait.
-    """
-    text = (text or "").strip()
-    if not text:
-        return ALT_TAB_TITLE_MIN_MS
-    words = len(text.split())
-    punctuation = sum(text.count(ch) for ch in ".,;:!?-_")
-    estimate = max(
-        words * ALT_TAB_TITLE_WORD_MS,
-        len(text) * ALT_TAB_TITLE_CHAR_MS,
-    )
-    estimate += (
-        punctuation * ALT_TAB_TITLE_PUNCT_MS
-        + ALT_TAB_TITLE_STARTUP_MS
-    )
-    return max(ALT_TAB_TITLE_MIN_MS, min(estimate, ALT_TAB_TITLE_MAX_MS))
-
-
 def _estimate_focus_speech_ms(sequence):
     text = " ".join(_plain_strings(sequence))
     if not text:
@@ -1413,12 +1381,8 @@ def _clear_alt_tab_state():
     global _alt_tab_session_until
     global _alt_tab_title_guard_until
     global _alt_tab_release_seen_at
-    global _alt_tab_quick_release_deadline
     global _alt_tab_focus_generation
     global _alt_tab_focus_pending
-    global _alt_tab_current_title
-    global _alt_tab_title_spoken
-    global _alt_tab_quick_release_mode
     global _alt_tab_post_focus_until
     global _alt_tab_post_focus_hwnd
 
@@ -1426,14 +1390,11 @@ def _clear_alt_tab_state():
     _alt_tab_session_until = 0.0
     _alt_tab_title_guard_until = 0.0
     _alt_tab_release_seen_at = 0.0
-    _alt_tab_quick_release_deadline = 0.0
     _alt_tab_focus_pending = False
-    _alt_tab_current_title = ""
-    _alt_tab_title_spoken = False
-    _alt_tab_quick_release_mode = False
     _alt_tab_post_focus_until = 0.0
     _alt_tab_post_focus_hwnd = 0
     _alt_tab_focus_generation += 1
+
 
 def _build_current_focus_sequence(target_hwnd):
     """Return the current focused control/line without repeating the title."""
@@ -1476,36 +1437,14 @@ def _build_current_focus_sequence(target_hwnd):
     return bool(sequence), sequence, _focus_object_summary(obj)
 
 
-def _finish_alt_tab_report(target_hwnd):
-    """End the active Alt+Tab sequence and suppress its late native chatter."""
+def _speak_alt_tab_focus(generation, attempt=0):
     global _alt_tab_preview_wait_until
     global _alt_tab_session_until
     global _alt_tab_title_guard_until
-    global _alt_tab_release_seen_at
-    global _alt_tab_quick_release_deadline
     global _alt_tab_focus_pending
-    global _alt_tab_current_title
-    global _alt_tab_title_spoken
-    global _alt_tab_quick_release_mode
     global _alt_tab_post_focus_until
     global _alt_tab_post_focus_hwnd
 
-    _alt_tab_preview_wait_until = 0.0
-    _alt_tab_session_until = 0.0
-    _alt_tab_title_guard_until = 0.0
-    _alt_tab_release_seen_at = 0.0
-    _alt_tab_quick_release_deadline = 0.0
-    _alt_tab_focus_pending = False
-    _alt_tab_current_title = ""
-    _alt_tab_title_spoken = False
-    _alt_tab_quick_release_mode = False
-    _alt_tab_post_focus_hwnd = target_hwnd
-    _alt_tab_post_focus_until = (
-        time.monotonic() + ALT_TAB_POST_FOCUS_GUARD_MS / 1000.0
-    )
-
-
-def _speak_alt_tab_focus(generation, attempt=0):
     if generation != _alt_tab_focus_generation:
         return
 
@@ -1520,7 +1459,14 @@ def _speak_alt_tab_focus(generation, attempt=0):
         )
         return
 
-    _finish_alt_tab_report(target_hwnd)
+    _alt_tab_preview_wait_until = 0.0
+    _alt_tab_session_until = 0.0
+    _alt_tab_title_guard_until = 0.0
+    _alt_tab_focus_pending = False
+    _alt_tab_post_focus_hwnd = target_hwnd
+    _alt_tab_post_focus_until = (
+        time.monotonic() + ALT_TAB_POST_FOCUS_GUARD_MS / 1000.0
+    )
 
     if focus_sequence:
         try:
@@ -1537,167 +1483,37 @@ def _speak_alt_tab_focus(generation, attempt=0):
             log.exception("Unable to speak Alt+Tab focused control")
 
 
-def _speak_alt_tab_quick_release(generation, attempt=0):
-    """Speak one quick-release utterance: '<title>: <focus>'."""
-    if generation != _alt_tab_focus_generation or not _alt_tab_focus_pending:
-        return
-    if not _alt_tab_quick_release_mode or not _alt_tab_current_title:
-        return
-
-    title = _alt_tab_current_title
-    target_hwnd = int(winUser.getForegroundWindow() or 0)
-    try:
-        focus_obj = api.getFocusObject()
-    except Exception:
-        focus_obj = None
-    transient_reason = _window_requires_native_speech(target_hwnd, focus_obj)
-    if transient_reason and attempt < ALT_TAB_FOCUS_MAX_ATTEMPTS:
-        core.callLater(
-            ALT_TAB_FOCUS_RETRY_MS,
-            _speak_alt_tab_quick_release,
-            generation,
-            attempt + 1,
-        )
-        return
-
-    prepared, focus_sequence, source = _build_current_focus_sequence(target_hwnd)
-    if not prepared and attempt < ALT_TAB_FOCUS_MAX_ATTEMPTS:
-        core.callLater(
-            ALT_TAB_FOCUS_RETRY_MS,
-            _speak_alt_tab_quick_release,
-            generation,
-            attempt + 1,
-        )
-        return
-
-    combined_sequence = [f"{title}:"]
-    if focus_sequence:
-        combined_sequence.extend(focus_sequence)
-
-    _finish_alt_tab_report(target_hwnd)
-
-    try:
-        _orig_speak(combined_sequence)
-        log.info(
-            "Spoke quick-release Alt+Tab title/focus as one utterance: "
-            "hwnd=%s source=%s items=%s thresholdMs=%s title=%r",
-            target_hwnd,
-            source,
-            len(combined_sequence),
-            ALT_TAB_QUICK_RELEASE_MS,
-            title,
-        )
-    except Exception:
-        log.exception("Unable to speak quick-release Alt+Tab combined report")
-
-
-def _start_alt_tab_plain_title(generation):
-    """Start the plain title after the 150 ms quick-release decision window."""
-    global _alt_tab_title_guard_until
-    global _alt_tab_title_spoken
-
-    if generation != _alt_tab_focus_generation or not _alt_tab_focus_pending:
-        return
-    if _alt_tab_title_spoken or _alt_tab_quick_release_mode:
-        return
-    title = _alt_tab_current_title
-    if not title:
-        return
-
-    now = time.monotonic()
-    title_ms = _estimate_fast_transition_title_speech_ms(title)
-    _alt_tab_title_spoken = True
-    _alt_tab_title_guard_until = now + title_ms / 1000.0
-    try:
-        _orig_speak([title])
-        log.info(
-            "Spoke held Alt+Tab plain title after quick-release threshold: "
-            "thresholdMs=%s titleMs=%s timerMs=%s title=%r",
-            ALT_TAB_QUICK_RELEASE_MS,
-            title_ms,
-            ALT_TAB_TITLE_FOCUS_DELAY_MS,
-            title,
-        )
-    except Exception:
-        log.exception("Unable to speak held Alt+Tab plain title")
-
-
 def _poll_alt_release_for_focus(generation):
-    """Drive the three requested Alt+Tab timing states.
+    """Run the complete post-title timer before deciding when focus speaks.
 
-    1. Alt released within 150 ms:
-       speak one combined '<title>: <focus>' utterance.
-    2. Alt held past 150 ms but released before the title estimate completes:
-       speak '<title>' at 150 ms, then '<focus>' after title completion.
-    3. Alt held beyond title completion:
-       stay silent until Alt-up, then speak '<focus>'.
+    Sequence:
+      * Let the selected window title finish.
+      * Run the full 50 ms post-title timer.
+      * At timer expiry:
+          - if Alt has already been released, speak focus;
+          - if Alt is still held, remain silent until release, then speak focus
+            immediately.
     """
     global _alt_tab_release_seen_at
-    global _alt_tab_quick_release_mode
+    global _alt_tab_focus_pending
 
     if generation != _alt_tab_focus_generation or not _alt_tab_focus_pending:
         return
 
     now = time.monotonic()
-    if _alt_tab_session_until and now >= _alt_tab_session_until:
-        _clear_alt_tab_state()
-        return
-
-    if not _alt_key_is_down() and not _alt_tab_release_seen_at:
-        _alt_tab_release_seen_at = now
-        is_quick = bool(
-            _alt_tab_quick_release_deadline
-            and now <= _alt_tab_quick_release_deadline
-        )
-        if is_quick:
-            _alt_tab_quick_release_mode = True
-        log.info(
-            "Observed Alt release during Alt+Tab decision sequence: "
-            "quickRelease=%s elapsedMs=%s thresholdMs=%s",
-            is_quick,
-            int(max(0.0, now - (_alt_tab_quick_release_deadline - ALT_TAB_QUICK_RELEASE_MS / 1000.0)) * 1000)
-                if _alt_tab_quick_release_deadline else -1,
-            ALT_TAB_QUICK_RELEASE_MS,
-        )
-
-    # We can know the release timing before the task switcher has supplied its
-    # title. Keep polling, but never invent or speak a title until it arrives.
-    if not _alt_tab_current_title:
-        core.callLater(
-            ALT_TAB_RELEASE_POLL_MS,
-            _poll_alt_release_for_focus,
-            generation,
-        )
-        return
-
-    # Case 1: a tap released within 150 ms. Do not speak a separate title first;
-    # wait for the real target focus and report the entire result in one call.
-    if _alt_tab_quick_release_mode and not _alt_tab_title_spoken:
-        _speak_alt_tab_quick_release(generation, 0)
-        return
-
-    # While Alt remains down during the first 150 ms, deliberately keep the
-    # task-switcher selection silent. At the threshold, commit to the plain-title
-    # path. A release after this point is case 2 or case 3, never case 1.
-    if not _alt_tab_title_spoken:
-        if now < _alt_tab_quick_release_deadline:
-            core.callLater(
-                min(
-                    ALT_TAB_RELEASE_POLL_MS,
-                    max(1, int((_alt_tab_quick_release_deadline - now) * 1000)),
-                ),
-                _poll_alt_release_for_focus,
-                generation,
-            )
-            return
-        _start_alt_tab_plain_title(generation)
-        now = time.monotonic()
-
     title_end = _alt_tab_title_guard_until
     timer_end = title_end + ALT_TAB_TITLE_FOCUS_DELAY_MS / 1000.0
 
-    # Case 2: Alt may already be up, but focus waits for the complete estimated
-    # title plus the existing short post-title gap.
+    if not _alt_key_is_down() and not _alt_tab_release_seen_at:
+        _alt_tab_release_seen_at = now
+        log.info(
+            "Observed Alt release during Alt+Tab title/timer sequence: "
+            "beforeTimerExpiry=%s",
+            now < timer_end,
+        )
+
+    # The title and the complete 50 ms timer always finish before focus can
+    # speak, regardless of when Alt was released.
     if now < timer_end:
         core.callLater(
             min(
@@ -1709,22 +1525,22 @@ def _poll_alt_release_for_focus(generation):
         )
         return
 
-    # Case 2 completion, or case 3 after Alt-up.
     if not _alt_key_is_down():
         log.info(
-            "Speaking Alt+Tab focus after held-title path: delayMs=%s",
+            "Speaking Alt+Tab focus after full post-title timer: delayMs=%s",
             ALT_TAB_TITLE_FOCUS_DELAY_MS,
         )
         _speak_alt_tab_focus(generation, 0)
         return
 
-    # Case 3: the title has finished while Alt is still held. Remain completely
-    # silent until the release is observed.
+    # The timer has expired while Alt remains held. Stay silent and speak the
+    # focus on the first poll after Alt is released.
     core.callLater(
         ALT_TAB_RELEASE_POLL_MS,
         _poll_alt_release_for_focus,
         generation,
     )
+
 
 def _release_minitray_speech_for_alt_tab():
     """Explicit user navigation takes priority over queued MiniTray results."""
@@ -1732,10 +1548,12 @@ def _release_minitray_speech_for_alt_tab():
 
 
 def _handle_alt_tab_speech(sequence, args, kwargs):
-    """Capture Alt+Tab titles and suppress native chatter around custom reports."""
+    """Speak the selected title, then its focus after Alt is released."""
     global _alt_tab_preview_wait_until
     global _alt_tab_session_until
-    global _alt_tab_current_title
+    global _alt_tab_title_guard_until
+    global _alt_tab_release_seen_at
+    global _alt_tab_focus_pending
     global _alt_tab_post_focus_until
     global _alt_tab_post_focus_hwnd
     global _quiet_until
@@ -1781,31 +1599,26 @@ def _handle_alt_tab_speech(sequence, args, kwargs):
 
                 _alt_tab_preview_wait_until = 0.0
                 _quiet_until = 0.0
-                _alt_tab_current_title = title
+                title_ms = _estimate_title_speech_ms(title)
+                _alt_tab_title_guard_until = now + title_ms / 1000.0
+                _alt_tab_release_seen_at = 0.0
+                _alt_tab_focus_pending = True
                 generation = _alt_tab_focus_generation
+                core.callLater(
+                    ALT_TAB_RELEASE_POLL_MS,
+                    _poll_alt_release_for_focus,
+                    generation,
+                )
                 log.info(
-                    "Captured Alt+Tab title for 150 ms release decision: "
-                    "deadlineRemainingMs=%s title=%r",
-                    max(0, int((_alt_tab_quick_release_deadline - now) * 1000)),
+                    "Speaking uninterrupted Alt+Tab title with fixed timer: "
+                    "titleMs=%s timerMs=%s title=%r",
+                    title_ms,
+                    ALT_TAB_TITLE_FOCUS_DELAY_MS,
                     title,
                 )
-                # The gesture-start poll may already know Alt was released. Run
-                # the state machine immediately rather than waiting another tick.
-                core.callLater(0, _poll_alt_release_for_focus, generation)
-                return True, None
+                return True, _orig_speak([title], *args, **kwargs)
 
     if _alt_tab_focus_pending:
-        # Before a title is captured, all task-switcher/native transition speech
-        # is implementation chatter. The gesture-start release poll remains
-        # active independently, so suppressing this cannot lose quick-release
-        # timing information.
-        if not _alt_tab_current_title:
-            log.info(
-                "Suppressed Alt+Tab native speech while awaiting selected title: %r",
-                _plain_strings(sequence),
-            )
-            return True, None
-
         current_hwnd = int(winUser.getForegroundWindow() or 0)
         try:
             focus_obj = api.getFocusObject()
@@ -1815,7 +1628,7 @@ def _handle_alt_tab_speech(sequence, args, kwargs):
             current_hwnd,
             focus_obj,
         )
-        if native_reason and not _alt_key_is_down():
+        if native_reason:
             log.info(
                 "Released Alt+Tab target to native speech after foreground: "
                 "hwnd=%s reason=%s",
@@ -1825,13 +1638,16 @@ def _handle_alt_tab_speech(sequence, args, kwargs):
             _clear_alt_tab_state()
             return False, None
 
+        # Drop the release-time duplicate title and focus burst. The focused
+        # control is reported once by _speak_alt_tab_focus after a real pause.
         log.info(
-            "Suppressed native Alt+Tab speech during custom timing sequence: %r",
+            "Suppressed native Alt+Tab release speech before custom focus: %r",
             _plain_strings(sequence),
         )
         return True, None
 
     return False, None
+
 
 def _cancel_speech(*args, **kwargs):
     """Protect synthesized title/focus sequences from transition cancellation."""
@@ -1839,6 +1655,21 @@ def _cancel_speech(*args, **kwargs):
     global _alt_tab_post_focus_hwnd
     global _foreground_post_focus_until
     global _foreground_post_focus_hwnd
+
+    probe = _close_reveal_probe_state
+    if probe is not None:
+        try:
+            foreground_hwnd = int(winUser.getForegroundWindow() or 0)
+        except Exception:
+            foreground_hwnd = 0
+        if foreground_hwnd == probe.get("target_hwnd", 0):
+            log.info(
+                "Buffered native cancellation during tentative close reveal: "
+                "previousHwnd=%s targetHwnd=%s",
+                probe.get("previous_hwnd", 0),
+                probe.get("target_hwnd", 0),
+            )
+            return
 
     watch = _new_foreground_watch
     if (
@@ -1897,6 +1728,24 @@ def _window_exists(hwnd):
         return False
     try:
         return bool(ctypes.windll.user32.IsWindow(int(hwnd)))
+    except Exception:
+        return False
+
+
+def _window_is_visible(hwnd):
+    if not hwnd:
+        return False
+    try:
+        return bool(ctypes.windll.user32.IsWindowVisible(int(hwnd)))
+    except Exception:
+        return False
+
+
+def _window_is_minimized(hwnd):
+    if not hwnd:
+        return False
+    try:
+        return bool(ctypes.windll.user32.IsIconic(int(hwnd)))
     except Exception:
         return False
 
@@ -2300,21 +2149,10 @@ def _start_new_foreground_title(watch):
 
     title = watch["title"]
     now = time.monotonic()
-    title_ms = _estimate_fast_transition_title_speech_ms(title)
+    title_ms = _estimate_title_speech_ms(title)
     watch["title_spoken"] = True
     watch["release_at"] = (
         now + (title_ms + ALT_TAB_TITLE_FOCUS_DELAY_MS) / 1000.0
-    )
-    # Keep native transition chatter suppressed through the complete focus
-    # retry window, including long titles near the fast estimator's upper cap.
-    retry_tail_ms = (
-        (NEW_FOREGROUND_FOCUS_MAX_ATTEMPTS + 1)
-        * NEW_FOREGROUND_FOCUS_RETRY_MS
-        + 250
-    )
-    watch["deadline"] = max(
-        watch["deadline"],
-        watch["release_at"] + retry_tail_ms / 1000.0,
     )
     _quiet_until = 0.0
 
@@ -2337,9 +2175,67 @@ def _start_new_foreground_title(watch):
     return _orig_speak([title])
 
 
-def _cancel_close_reveal_probe():
+def _replay_close_reveal_buffer(probe, reason):
+    buffered = list(probe.get("buffer", [])) if probe else []
+    if not buffered:
+        return
+    log.info(
+        "Replaying buffered native foreground speech: reason=%s items=%s "
+        "previousHwnd=%s targetHwnd=%s",
+        reason,
+        len(buffered),
+        probe.get("previous_hwnd", 0),
+        probe.get("target_hwnd", 0),
+    )
+    for sequence, args, kwargs in buffered:
+        try:
+            _orig_speak(sequence, *args, **kwargs)
+        except Exception:
+            log.exception("Unable to replay buffered native foreground speech")
+
+
+def _cancel_close_reveal_probe(replay=False, reason="cancelled"):
     global _close_reveal_probe_generation
+    global _close_reveal_probe_state
+
+    old_probe = _close_reveal_probe_state
     _close_reveal_probe_generation += 1
+    _close_reveal_probe_state = None
+    if replay and old_probe is not None:
+        _replay_close_reveal_buffer(old_probe, reason)
+
+
+def _handle_close_reveal_probe_speech(sequence, args, kwargs):
+    """Hold native focus speech until we know whether the previous HWND closed."""
+    probe = _close_reveal_probe_state
+    if probe is None:
+        return False, None
+
+    try:
+        foreground_hwnd = int(winUser.getForegroundWindow() or 0)
+    except Exception:
+        foreground_hwnd = 0
+    if foreground_hwnd != probe.get("target_hwnd", 0):
+        _cancel_close_reveal_probe(False, "foreground changed again")
+        return False, None
+
+    try:
+        saved_sequence = list(sequence)
+    except Exception:
+        saved_sequence = sequence
+
+    probe["buffer"].append((saved_sequence, tuple(args), dict(kwargs)))
+    if len(probe["buffer"]) > 20:
+        probe["buffer"] = probe["buffer"][-20:]
+
+    log.info(
+        "Buffered native speech during tentative close reveal: "
+        "previousHwnd=%s targetHwnd=%s speech=%r",
+        probe.get("previous_hwnd", 0),
+        probe.get("target_hwnd", 0),
+        _text_items(sequence),
+    )
+    return True, None
 
 
 def _probe_close_reveal(
@@ -2348,13 +2244,22 @@ def _probe_close_reveal(
     target_hwnd,
     attempt=0,
 ):
+    global _close_reveal_probe_state
+
     if generation != _close_reveal_probe_generation:
         return
 
+    probe = _close_reveal_probe_state
+    if probe is None or probe.get("generation") != generation:
+        return
+
     if int(winUser.getForegroundWindow() or 0) != int(target_hwnd):
+        _cancel_close_reveal_probe(False, "foreground moved before classification")
         return
 
     if not _window_exists(previous_hwnd):
+        _close_reveal_probe_state = None
+
         try:
             obj = api.getForegroundObject()
         except Exception:
@@ -2364,6 +2269,19 @@ def _probe_close_reveal(
                 obj = _get_fresh_operating_system_focus()
             except Exception:
                 obj = None
+
+        native_reason = _window_requires_native_speech(target_hwnd, obj)
+        if native_reason:
+            _watch_new_foreground_window(
+                obj,
+                target_hwnd,
+                "revealed after previous window closed",
+            )
+            _replay_close_reveal_buffer(
+                probe,
+                "confirmed close revealed native/special window",
+            )
+            return
 
         try:
             if _orig_cancel_speech is not None:
@@ -2375,11 +2293,12 @@ def _probe_close_reveal(
             )
 
         log.info(
-            "Confirmed deferred close reveal: previousHwnd=%s "
-            "targetHwnd=%s attempt=%s",
+            "Confirmed deferred close reveal; discarded buffered chatter: "
+            "previousHwnd=%s targetHwnd=%s attempt=%s buffered=%s",
             previous_hwnd,
             target_hwnd,
             attempt,
+            len(probe.get("buffer", [])),
         )
         _watch_new_foreground_window(
             obj,
@@ -2388,7 +2307,23 @@ def _probe_close_reveal(
         )
         return
 
+    # Ordinary foreground changes should not wait for the full close timeout.
+    if (
+        attempt == 0
+        and not probe.get("close_expected")
+        and (
+            _window_is_visible(previous_hwnd)
+            or _window_is_minimized(previous_hwnd)
+        )
+    ):
+        _cancel_close_reveal_probe(True, "ordinary foreground switch")
+        return
+
     if attempt >= CLOSE_REVEAL_PROBE_MAX_ATTEMPTS:
+        _cancel_close_reveal_probe(
+            True,
+            "close probe expired with previous window still alive",
+        )
         log.debug(
             "Close-reveal probe expired with previous window still alive: "
             "previousHwnd=%s targetHwnd=%s",
@@ -2409,9 +2344,32 @@ def _probe_close_reveal(
 
 def _schedule_close_reveal_probe(previous_hwnd, target_hwnd):
     global _close_reveal_probe_generation
+    global _close_reveal_probe_state
+
+    now = time.monotonic()
+    close_expected = bool(
+        previous_hwnd
+        and previous_hwnd == _last_close_gesture_hwnd
+        and now - _last_close_gesture_at <= 1.5
+    )
+    if (
+        previous_hwnd
+        and not _window_is_visible(previous_hwnd)
+        and not _window_is_minimized(previous_hwnd)
+    ):
+        close_expected = True
 
     _close_reveal_probe_generation += 1
     generation = _close_reveal_probe_generation
+    _close_reveal_probe_state = {
+        "generation": generation,
+        "previous_hwnd": int(previous_hwnd or 0),
+        "target_hwnd": int(target_hwnd or 0),
+        "close_expected": close_expected,
+        "buffer": [],
+        "started_at": now,
+    }
+
     core.callLater(
         CLOSE_REVEAL_PROBE_DELAY_MS,
         _probe_close_reveal,
@@ -2420,6 +2378,7 @@ def _schedule_close_reveal_probe(previous_hwnd, target_hwnd):
         target_hwnd,
         0,
     )
+
 
 
 def _watch_new_foreground_window(obj, hwnd, reason):
@@ -2443,10 +2402,13 @@ def _watch_new_foreground_window(obj, hwnd, reason):
 
     native_reason = _window_requires_native_speech(hwnd, obj)
     if native_reason:
+        # Native/special surfaces are a hard boundary: conceptSphereQuiet
+        # clears any deterministic window sequence and then gets completely
+        # out of NVDA's way. No custom focus repair or speech replacement.
         _clear_new_foreground_watch()
         _clear_foreground_post_focus_guard()
         log.info(
-            "Preserved native foreground speech: hwnd=%s reason=%s",
+            "Preserved fully native foreground behavior: hwnd=%s reason=%s",
             hwnd,
             native_reason,
         )
@@ -2615,6 +2577,32 @@ def _normalized_gesture_keys(gesture):
         return frozenset(keys)
     except Exception:
         return frozenset()
+
+
+def _is_window_close_gesture(gesture):
+    """Return True for the ordinary Alt+F4 top-level close gesture."""
+    keys = _normalized_gesture_keys(gesture)
+    alt_names = {"alt", "leftalt", "rightalt"}
+    return (
+        "f4" in keys
+        and bool(keys.intersection(alt_names))
+        and not bool(
+            keys.intersection(
+                {
+                    "control",
+                    "leftcontrol",
+                    "rightcontrol",
+                    "ctrl",
+                    "windows",
+                    "leftwindows",
+                    "rightwindows",
+                    "win",
+                    "leftwin",
+                    "rightwin",
+                }
+            )
+        )
+    )
 
 
 def _windows_desktop_gesture_name(gesture):
@@ -2833,25 +2821,6 @@ def _schedule_next_minitray_announcement():
     )
 
 
-def _speak_queued_restore_focus(generation, item):
-    if generation != _minitray_announcement_generation:
-        return
-    if not _minitray_announcement_active or _minitray_current_announcement is not item:
-        return
-    focus_sequence = item.get("focus_sequence") or []
-    if not focus_sequence:
-        return
-    try:
-        _orig_speak(focus_sequence)
-        log.info(
-            "MiniTray spoke restored focus after real pause: pauseMs=%s items=%s",
-            RESTORE_TITLE_FOCUS_PAUSE_MS,
-            len(focus_sequence),
-        )
-    except Exception:
-        log.exception("Unable to speak queued MiniTray restored focus")
-
-
 def _start_next_minitray_announcement(generation):
     global _minitray_announcement_active
     global _minitray_announcement_scheduled
@@ -2920,20 +2889,18 @@ def _start_next_minitray_announcement(generation):
     _minitray_announcement_active = True
     _minitray_current_announcement = item
 
+    speech_sequence = title_sequence
     if item["kind"] == "restore" and focus_sequence:
-        title_ms = _estimate_title_speech_ms(item["spoken_text"])
-        focus_ms = _estimate_focus_speech_ms(focus_sequence)
-        focus_delay_ms = title_ms + RESTORE_TITLE_FOCUS_PAUSE_MS
-        duration_ms = focus_delay_ms + focus_ms
-        item["focus_sequence"] = focus_sequence
-        core.callLater(
-            focus_delay_ms,
-            _speak_queued_restore_focus,
-            generation,
-            item,
-        )
-    else:
-        duration_ms = _estimate_minitray_speech_ms(title_sequence)
+        # Submit the complete restore result in ONE synthesizer utterance:
+        #   "<restore message> <window title>: <focus>"
+        # focus_sequence may contain language/state commands, so concatenate
+        # sequences rather than flattening it to text.
+        speech_sequence = [
+            item["spoken_text"].rstrip(" :"),
+            ": ",
+        ] + focus_sequence
+
+    duration_ms = _estimate_minitray_speech_ms(speech_sequence)
 
     item["actual_duration_ms"] = duration_ms
     _quiet_until = max(
@@ -2942,13 +2909,16 @@ def _start_next_minitray_announcement(generation):
     )
 
     try:
-        _orig_speak(title_sequence)
+        _orig_speak(speech_sequence)
         log.info(
-            "MiniTray announcement started: kind=%s durationMs=%s remaining=%s text=%r",
+            "MiniTray announcement started: kind=%s durationMs=%s remaining=%s "
+            "text=%r focusItems=%s singleUtterance=%s",
             item["kind"],
             duration_ms,
             len(_minitray_announcement_queue),
             item["spoken_text"],
+            len(focus_sequence),
+            bool(item["kind"] == "restore" and focus_sequence),
         )
     except Exception:
         log.exception(
@@ -3201,40 +3171,25 @@ def _deliver_restore_final_announcement(
     )
 
 
-def _speak_restore_focus_plain(serial, focus_sequence):
-    if serial != _restore_final_announcement_serial or not focus_sequence:
-        return
-    try:
-        _orig_speak(focus_sequence)
-    except Exception:
-        log.exception("Unable to speak delayed MiniTray restore focus")
-
-
 def _speak_restore_final_plain(serial, spoken_text, focus_sequence):
     if serial != _restore_final_announcement_serial:
         return
     try:
-        _orig_speak([spoken_text])
+        speech_sequence = [spoken_text]
         if focus_sequence:
-            delay_ms = (
-                _estimate_title_speech_ms(spoken_text)
-                + RESTORE_TITLE_FOCUS_PAUSE_MS
-            )
-            core.callLater(
-                delay_ms,
-                _speak_restore_focus_plain,
-                serial,
-                focus_sequence,
-            )
+            speech_sequence = [
+                spoken_text.rstrip(" :"),
+                ": ",
+            ] + focus_sequence
+        _orig_speak(speech_sequence)
         log.info(
-            "MiniTray spoke restore title with scheduled focus pause: "
-            "title=%r pauseMs=%s focusItems=%s",
+            "MiniTray spoke restore result as one utterance: "
+            "text=%r focusItems=%s",
             spoken_text,
-            RESTORE_TITLE_FOCUS_PAUSE_MS if focus_sequence else 0,
             len(focus_sequence),
         )
     except Exception:
-        log.exception("Unable to speak MiniTray restore title and focus")
+        log.exception("Unable to speak MiniTray restore result")
 
 
 def _parse_final_focus(text):
@@ -4598,6 +4553,14 @@ def _speak(sequence, *args, **kwargs):
     if alt_tab_handled:
         return alt_tab_result
 
+    close_probe_handled, close_probe_result = _handle_close_reveal_probe_speech(
+        sequence,
+        args,
+        kwargs,
+    )
+    if close_probe_handled:
+        return close_probe_result
+
     # MiniTray arms MTQUIET before it activates and closes a hidden window.
     # Honor that gate before the generic new-window watcher. Otherwise the
     # temporarily activated target (especially PowerShell), MiniTray popup
@@ -4768,6 +4731,151 @@ class SilentContainer(NVDAObject):
         return ""
 
 
+def _is_stale_explorer_dead_frame_focus(obj):
+    """True only for a delayed Explorer CabinetWClass event that is no longer foreground."""
+    try:
+        if (
+            getattr(obj, "windowClassName", "") or ""
+        ).casefold() != "cabinetwclass":
+            return False
+
+        obj_root = _root_window_handle(obj)
+        if not obj_root:
+            obj_root = int(getattr(obj, "windowHandle", 0) or 0)
+
+        foreground = int(winUser.getForegroundWindow() or 0)
+
+        # If this Explorer root really is foreground, explorerNav may perform
+        # its normal dead-frame repair. Otherwise the event is stale and must
+        # not redirect keyboard/NVDA focus back into Explorer.
+        return bool(
+            foreground
+            and obj_root
+            and foreground != obj_root
+        )
+    except Exception:
+        return False
+
+
+def _install_explorer_stale_focus_guard():
+    """Prevent explorerNav from redirecting stale CabinetWClass focus events."""
+    global _explorer_stale_focus_guard_module
+    global _explorer_stale_focus_guard_class
+    global _explorer_stale_focus_guard_original
+    global _explorer_stale_focus_guard_wrapper
+
+    try:
+        import importlib
+
+        explorer_module = importlib.import_module("appModules.explorer")
+        app_module_class = getattr(explorer_module, "AppModule", None)
+        if app_module_class is None:
+            log.warning(
+                "Explorer stale-focus guard: AppModule class unavailable"
+            )
+            return False
+
+        current = getattr(app_module_class, "event_gainFocus", None)
+        if current is None:
+            log.warning(
+                "Explorer stale-focus guard: event_gainFocus unavailable"
+            )
+            return False
+
+        if getattr(
+            current,
+            "_conceptSphereStaleExplorerFocusGuard",
+            False,
+        ):
+            _explorer_stale_focus_guard_module = explorer_module
+            _explorer_stale_focus_guard_class = app_module_class
+            _explorer_stale_focus_guard_wrapper = current
+            _explorer_stale_focus_guard_original = getattr(
+                current,
+                "_conceptSphereOriginalEventGainFocus",
+                None,
+            )
+            return True
+
+        original = current
+
+        def guarded_event_gainFocus(self, obj, nextHandler):
+            if _is_stale_explorer_dead_frame_focus(obj):
+                try:
+                    foreground = int(
+                        winUser.getForegroundWindow() or 0
+                    )
+                except Exception:
+                    foreground = 0
+
+                log.info(
+                    "Blocked stale Explorer dead-frame focus before redirect: "
+                    "explorerHwnd=%s foregroundHwnd=%s foregroundClass=%r",
+                    _root_window_handle(obj),
+                    foreground,
+                    _window_class_name(foreground),
+                )
+
+                # Crucially, do not call explorerNav's original handler.
+                # That handler's _ensure_item_focused redirect is what can
+                # pull focus back into Explorer after another window has
+                # already become foreground.
+                return
+
+            return original(self, obj, nextHandler)
+
+        guarded_event_gainFocus._conceptSphereStaleExplorerFocusGuard = True
+        guarded_event_gainFocus._conceptSphereOriginalEventGainFocus = original
+        app_module_class.event_gainFocus = guarded_event_gainFocus
+
+        _explorer_stale_focus_guard_module = explorer_module
+        _explorer_stale_focus_guard_class = app_module_class
+        _explorer_stale_focus_guard_original = original
+        _explorer_stale_focus_guard_wrapper = guarded_event_gainFocus
+
+        log.info("Installed Explorer stale dead-frame focus guard")
+        return True
+    except Exception:
+        log.exception(
+            "Unable to install Explorer stale dead-frame focus guard"
+        )
+        return False
+
+
+def _remove_explorer_stale_focus_guard():
+    """Restore explorerNav's original event_gainFocus method on plugin unload."""
+    global _explorer_stale_focus_guard_module
+    global _explorer_stale_focus_guard_class
+    global _explorer_stale_focus_guard_original
+    global _explorer_stale_focus_guard_wrapper
+
+    try:
+        app_module_class = _explorer_stale_focus_guard_class
+        original = _explorer_stale_focus_guard_original
+        wrapper = _explorer_stale_focus_guard_wrapper
+
+        if (
+            app_module_class is not None
+            and original is not None
+            and getattr(
+                app_module_class,
+                "event_gainFocus",
+                None,
+            ) is wrapper
+        ):
+            app_module_class.event_gainFocus = original
+    except Exception:
+        log.debugWarning(
+            "Unable to remove Explorer stale dead-frame focus guard",
+            exc_info=True,
+        )
+    finally:
+        _explorer_stale_focus_guard_module = None
+        _explorer_stale_focus_guard_class = None
+        _explorer_stale_focus_guard_original = None
+        _explorer_stale_focus_guard_wrapper = None
+
+
 # ------------------------------------------------------------ the plugin
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -4778,6 +4886,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         inputCore.decide_executeGesture.register(self._inputGestureObserver)
         _install_speak_hook()
         _install_cancel_speech_hook()
+        _install_explorer_stale_focus_guard()
         global _last_foreground_hwnd
         try:
             current_foreground = int(winUser.getForegroundWindow() or 0)
@@ -4790,7 +4899,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 exc_info=True,
             )
         log.info(
-            "conceptSphereQuiet loaded - build=2026.08.07-alt-tab-quick-title-focus; "
+            "conceptSphereQuiet loaded - build=2026.08.07-native-dialogs-stale-explorer-guard; "
             "quiet windows, focus ancestry, Start menu, and desktop churn suppression active"
         )
 
@@ -4806,12 +4915,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         global _alt_tab_session_until
         global _alt_tab_title_guard_until
         global _alt_tab_release_seen_at
-        global _alt_tab_quick_release_deadline
         global _alt_tab_focus_generation
         global _alt_tab_focus_pending
-        global _alt_tab_current_title
-        global _alt_tab_title_spoken
-        global _alt_tab_quick_release_mode
         global _alt_tab_post_focus_until
         global _alt_tab_post_focus_hwnd
         global _win_m_desktop_generation
@@ -4855,6 +4960,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 "Unable to unregister conceptSphereQuiet input observer",
                 exc_info=True,
             )
+        _remove_explorer_stale_focus_guard()
         _remove_cancel_speech_hook()
         _remove_speak_hook()
         super().terminate()
@@ -4866,17 +4972,28 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         global _alt_tab_session_until
         global _alt_tab_title_guard_until
         global _alt_tab_release_seen_at
-        global _alt_tab_quick_release_deadline
         global _alt_tab_focus_generation
         global _alt_tab_focus_pending
-        global _alt_tab_current_title
-        global _alt_tab_title_spoken
-        global _alt_tab_quick_release_mode
         global _alt_tab_post_focus_until
         global _alt_tab_post_focus_hwnd
         global _win_m_desktop_generation
         global _win_m_desktop_active
+        global _last_close_gesture_hwnd
+        global _last_close_gesture_at
         global _close_result_synthetic_input_until
+
+        if _is_window_close_gesture(gesture):
+            try:
+                _last_close_gesture_hwnd = int(
+                    winUser.getForegroundWindow() or 0
+                )
+            except Exception:
+                _last_close_gesture_hwnd = 0
+            _last_close_gesture_at = time.monotonic()
+            log.debug(
+                "Armed close-reveal speech buffer for Alt+F4: hwnd=%s",
+                _last_close_gesture_hwnd,
+            )
 
         if _is_alt_tab_gesture(gesture):
             _cancel_close_reveal_probe()
@@ -4884,15 +5001,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             _clear_foreground_post_focus_guard()
             now = time.monotonic()
 
-            had_active_alt_tab = bool(
-                _alt_tab_session_until
-                or _alt_tab_focus_pending
-                or _alt_tab_post_focus_until
+            had_alt_tab_speech = bool(
+                _alt_tab_focus_pending or _alt_tab_post_focus_until
             )
-            had_spoken_alt_tab_title = bool(_alt_tab_title_spoken)
-            if had_active_alt_tab:
+            if had_alt_tab_speech:
                 _clear_alt_tab_state()
-            if had_spoken_alt_tab_title and _orig_cancel_speech is not None:
+            if had_alt_tab_speech and _orig_cancel_speech is not None:
                 try:
                     _orig_cancel_speech()
                 except Exception:
@@ -4907,25 +5021,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             )
             _alt_tab_session_until = (
                 now + ALT_TAB_SESSION_MAX_MS / 1000.0
-            )
-            _alt_tab_title_guard_until = 0.0
-            _alt_tab_release_seen_at = 0.0
-            _alt_tab_quick_release_deadline = (
-                now + ALT_TAB_QUICK_RELEASE_MS / 1000.0
-            )
-            _alt_tab_focus_pending = True
-            _alt_tab_current_title = ""
-            _alt_tab_title_spoken = False
-            _alt_tab_quick_release_mode = False
-            generation = _alt_tab_focus_generation
-            core.callLater(
-                ALT_TAB_RELEASE_POLL_MS,
-                _poll_alt_release_for_focus,
-                generation,
-            )
-            log.info(
-                "Started Alt+Tab 150 ms release decision window: thresholdMs=%s",
-                ALT_TAB_QUICK_RELEASE_MS,
             )
             _desktop_input_serial += 1
             return True
@@ -5151,7 +5246,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 _known_foreground_hwnds.add(hwnd)
                 _last_foreground_hwnd = hwnd
 
-            if not was_known:
+            native_reason = _window_requires_native_speech(hwnd, obj)
+            if native_reason:
+                # Dialogs, menus, Start/Search, shell flyouts and other
+                # special surfaces remain entirely under NVDA's native event
+                # and speech handling. In particular, do NOT start the
+                # close-reveal speech buffer for these windows.
+                _clear_new_foreground_watch()
+                _clear_foreground_post_focus_guard()
+                log.info(
+                    "Preserved fully native foreground behavior: "
+                    "hwnd=%s reason=%s",
+                    hwnd,
+                    native_reason,
+                )
+            elif not was_known:
                 _watch_new_foreground_window(
                     obj,
                     hwnd,
@@ -5165,8 +5274,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                         "revealed after previous window closed",
                     )
                 else:
-                    # Explorer can expose the lower Explorer window before the
-                    # upper Explorer HWND has completed destruction.
+                    # Ordinary application windows still use the deferred
+                    # close-reveal transaction so Explorer close chatter can
+                    # be suppressed deterministically.
                     _schedule_close_reveal_probe(
                         previous_hwnd,
                         hwnd,

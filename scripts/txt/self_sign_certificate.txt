@@ -1,0 +1,7 @@
+$exe = "D:\Dropbox\Private\ConceptSphere\commands_and_scripts\.ahk\installer\ConceptSphere-Setup-2.0.exe"
+
+$cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert |
+        Where-Object { $_.Subject -eq "CN=ConceptSphere" } | Select-Object -First 1
+
+Set-AuthenticodeSignature -FilePath $exe -Certificate $cert `
+    -HashAlgorithm SHA256 -TimestampServer http://timestamp.digicert.com
