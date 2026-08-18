@@ -72,6 +72,13 @@ global STARTUP_MS    := 20000    ; ms of quiet at logon before the first round
 global COOLDOWN_MS   := 20000    ; ms of grace for a component after a restart
 global VERIFY_MS     := 12000    ; ms to wait for a restarted component to answer
 global MAX_PER_HOUR  := 4        ; restarts before a component is quarantined
+global UNQUARANTINE_MS := 3600000 ; ms of calm before a quarantined component is
+                                 ; watched again. RateLimited already forgets
+                                 ; restarts older than an hour, but the
+                                 ; quarantine flag never cleared by itself, so a
+                                 ; bad patch could silently disable the watchdog
+                                 ; until someone clicked the tray menu.
+                                 ; Set to 0 to keep quarantine manual-only.
 global LOG_FILE      := A_Temp "\ConceptSphereWatchdog.log"
 global LOG_MAX_BYTES := 262144
 global SPEAK         := 1        ; speak through NVDA when it is available
@@ -151,6 +158,17 @@ Sweep() {
 }
 
 CheckOne(c) {
+    ; Lift a quarantine once the component has been left alone long enough.
+    ; RateLimited() prunes history on the same rolling hour, so by this point
+    ; its restart count has already decayed and one more attempt is cheap.
+    if (c.quarantined && UNQUARANTINE_MS && c.history.Length) {
+        if (A_TickCount - c.history[c.history.Length] > UNQUARANTINE_MS) {
+            c.quarantined := false
+            c.strikeCount := 0
+            Log(c.name ": quarantine lifted after " (UNQUARANTINE_MS // 60000) " min of calm")
+        }
+    }
+
     if c.ignored || c.quarantined || (A_TickCount < c.cooldownUntil)
         return
 
@@ -165,7 +183,7 @@ CheckOne(c) {
 
     ; Running. A window we cannot find, or one that will not answer, both mean
     ; the message loop is not serving requests.
-    if hwnd && Responding(hwnd) {
+    if hwnd && RespondingExe(c.exe) {
         if c.strikeCount
             Log(c.name ": responding again after " c.strikeCount " missed ping(s)")
         c.strikeCount := 0
@@ -182,8 +200,26 @@ CheckOne(c) {
     }
 }
 
+; Any window owned by the component. Do NOT hard-code AHK's main-window class
+; here: this used to read `ahk_class AutoHotkey ahk_exe ...`, which never
+; matched, so FindWindow always returned 0 and every component looked wedged
+; forever. Matching on the exe alone survives whatever AHK calls its window.
+; (DetectHiddenWindows is true, so the hidden main window is in scope.)
 FindWindow(exe) {
-    return WinExist("ahk_class AutoHotkey ahk_exe " exe)
+    return WinExist("ahk_exe " exe)
+}
+
+; Responsive if ANY window the process owns answers. All of a script's windows
+; are served by the same message loop, so pinging whichever one WinExist
+; happened to return first is needlessly fragile -- a component that owns both
+; a GUI and its hidden main window should not be judged on the luck of the draw.
+RespondingExe(exe) {
+    try {
+        for hwnd in WinGetList("ahk_exe " exe)
+            if Responding(hwnd)
+                return true
+    }
+    return false
 }
 
 ; WM_NULL costs the target nothing; SMTO_ABORTIFHUNG returns immediately when
@@ -225,7 +261,7 @@ Recover(c, why) {
     deadline := A_TickCount + VERIFY_MS
     while (A_TickCount < deadline) {
         Sleep 500
-        if (h := FindWindow(c.exe)) && Responding(h) {
+        if FindWindow(c.exe) && RespondingExe(c.exe) {
             ok := true
             break
         }
@@ -252,7 +288,7 @@ Recover(c, why) {
 StopIt(c) {
     if FindWindow(c.exe) {
         try {
-            WinClose("ahk_class AutoHotkey ahk_exe " c.exe, , 2)
+            WinClose("ahk_exe " c.exe, , 2)
             if !ProcessExist(c.exe) {
                 Log(c.name ": closed cleanly")
                 return
@@ -505,7 +541,7 @@ ComponentLine(c) {
         state := "not running"
     else if !hwnd
         state := "running, no message window"
-    else if Responding(hwnd)
+    else if RespondingExe(c.exe)
         state := "running and responding"
     else
         state := "running but NOT RESPONDING"

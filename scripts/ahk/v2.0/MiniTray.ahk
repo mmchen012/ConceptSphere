@@ -3,7 +3,7 @@
 #NoTrayIcon                     ; icon appears only while windows are hidden
 
 ; =============================================================================
-;  MiniTray.ahk  -  v2.29 (Explorer active-HWND normalization)
+;  MiniTray.ahk  -  v2.37 (quiet empty-menu/save/final-restore tray reflow)
 ;
 ;  Merged window manager: rule-driven auto-sizing (was WindowSizer v1.1) plus
 ;  hide-to-tray (was MiniTrayUtil). One process, one WinEvent dispatcher, one
@@ -57,6 +57,9 @@ global CFG_SEC   := "__MiniTray__"
 global OLD_CFG   := "__WindowSizer__"   ; pre-rename config section, migrated on startup
 global HID_SEC   := "__Hidden__"
 global MAX_LABEL := 60
+global NATIVE_RESTORE_HANDOFF_SETTLE := 25 ; let NVDA consume MTQUIET:0 / MTNATIVERESTORE
+global NVDA_MODE_GUARD_SETTLE := 8     ; let NVDA disable automatic browse/focus-mode switching before a hide moves focus
+global NVDA_MODE_GUARD_TIMEOUT := 1800 ; failsafe; explicit release normally happens much sooner
 global SPEECH_SETTLE := 350       ; ms to let focus changes and notification-area
                                   ;   reflow finish before we speak. Anything that
                                   ;   talks AFTER us cancels us, so we go last.
@@ -115,6 +118,7 @@ global g_Rules    := []         ; parsed rule cache
 global g_Stamp    := ""         ; INI mtime|size, to know when to reparse
 global g_Cfg      := Map()      ; parsed [__MiniTray__]
 global g_Hidden   := []         ; [{hwnd, pid, proc, title, how}] oldest first
+global g_NvdaModeGuardSerial := 1
 global g_PopupGui  := 0           ; the tray popup, replacing AHK's tray menu
 global g_PopupLabel := 0          ; accessible label for the current list level
 global g_PopupLB    := 0
@@ -185,6 +189,13 @@ else if (!A_IsCompiled)
     TraySetIcon("shell32.dll", 44)
 A_IconTip := APP_NAME           ; CONSTANT - never append counts or titles
 
+; MiniTray owns its notification-area icon directly (see MTIcon_* at the end
+; of this file). Normal hide/show uses NIM_MODIFY + NIS_HIDDEN, and shutdown
+; deliberately does NOT send NIM_DELETE. The Explorer crash path reached
+; NotificationAreaIconManager2::DeleteIcon -> NotificationAreaIcon2::Close, so
+; this build never explicitly enters that path.
+MTIcon_Init()
+
 ; AHK's own main window is normally hidden, but the shell can foreground and
 ; show it when hosting a tray menu. WS_EX_TOOLWINDOW keeps it out of Alt+Tab
 ; whatever happens; applied now, while it is still hidden, so it is in force
@@ -207,7 +218,6 @@ DebugLog("Startup complete: hidden=" g_Hidden.Length " rules=" g_Rules.Length
     " shellPid=" g_ShellPid " ini=" INI_FILE, "INFO")
 SetTimer(Prune, 5000)
 OnExit(HandleExit)
-SetTimer(AnnounceStartup, -250)
 
 if (A_Args.Length >= 1 && IsShowArg(A_Args[1]))
     ShowMainGui()
@@ -323,6 +333,35 @@ Announce(text, cancel := true) {
         DllCall("nvdaControllerClient64" ;   the shell off without adding noise
               . "\nvdaController_speakText", "Str", text, "UInt")
 }
+SendPluginControl(text) {
+    global g_Cfg
+    if (g_Cfg.Get("QuietPlugin", "1") != "1")
+        return false
+
+    ; Control sentinels are protocol, not user-facing MiniTray status speech.
+    ; Send them even when Speak=0 so the NVDA add-on can still distinguish a
+    ; native restore handoff from its independent new-window/close logic.
+    savedSpeak := g_Cfg.Get("Speak", "0")
+    g_Cfg["Speak"] := "1"
+    try {
+        Announce(text, false)
+        return true
+    } finally {
+        g_Cfg["Speak"] := savedSpeak
+    }
+}
+
+SignalNativeNvdaRestore(e, spokenPrefix := "") {
+    if !e
+        return false
+
+    payload := Chr(1) "MTNATIVERESTORE:" e.hwnd ":" e.pid
+    if (spokenPrefix != "")
+        payload .= ":" spokenPrefix
+    payload .= Chr(1)
+    return SendPluginControl(payload)
+}
+
 AnnounceHidden() {
     global g_Hidden
     if (g_Hidden.Length = 0) {
@@ -355,20 +394,6 @@ Say(text) {
 
 ClearToolTip() {
     ToolTip()
-}
-
-AnnounceStartup(*) {
-    global g_Cfg
-
-    ; Startup is an explicit lifecycle notification, so speak it even when
-    ; routine MiniTray speech is disabled. Delay until initialization is fully
-    ; complete, then protect it from late launcher and notification-area focus.
-    savedSpeak := g_Cfg.Get("Speak", "0")
-    g_Cfg["Speak"] := "1"
-    StartQuiet(1000)
-    SayQuietFinal("MiniTray started", 800)
-    g_Cfg["Speak"] := savedSpeak
-    DebugLog("Startup announcement handed off", "INFO")
 }
 
 JoinFrom(arr, start, sep) {
@@ -1463,9 +1488,33 @@ FindHidden(hwnd) {
     return 0
 }
 
+; During very rapid consecutive Shift+Escape presses, Windows can briefly keep
+; GetForegroundWindow/WinExist("A") on the Explorer HWND that MiniTray just hid.
+; That HWND is already present in g_Hidden, so treating it as the new target
+; produces a false "unable to hide window". Recover only this impossible/stale
+; state by selecting the first still-visible native Alt+Tab destination.
+ResolveStaleHiddenHideTarget(hwnd) {
+    if (!hwnd || !FindHidden(hwnd))
+        return hwnd
+
+    for candidate in GetNativeAltTabChain() {
+        if (!candidate || candidate = hwnd || FindHidden(candidate))
+            continue
+        DebugLog(
+            "Recovered stale hidden foreground for hide: stale="
+            DebugWindow(hwnd) " target=" DebugWindow(candidate),
+            "INFO"
+        )
+        return candidate
+    }
+
+    return hwnd
+}
+
 HideActiveToTray() {
     rawHwnd := WinExist("A")
     hwnd := ResolveExplorerActiveWindow(rawHwnd)
+    hwnd := ResolveStaleHiddenHideTarget(hwnd)
     blockReason := hwnd ? WindowHideBlockReason(hwnd) : "no active window"
 
     if (hwnd != rawHwnd) {
@@ -1697,13 +1746,18 @@ HideToTray(hwnd, batchMode := false, batchId := 0, batchRank := 0
     recorded := false
     taskbarRemoved := false
     speechHandedOff := false
+    modeGuardToken := 0
 
     ; Open the NVDA quiet window BEFORE WinMinimize/WinHide. Previously this
     ; happened after Explorer had already moved focus, so NVDA had time to queue
     ; the transient "<page title> document" and "same page link" lines. A
     ; hide-all batch owns one longer quiet window around the complete sequence.
-    if !batchMode
+    if !batchMode {
         StartQuiet()
+        ; Unlike restore, a hide can transfer foreground as part of WinHide or
+        ; WinMinimize itself. Arm the mode guard before either API is touched.
+        modeGuardToken := BeginNvdaModeGuard()
+    }
 
     try {
         try {
@@ -1768,23 +1822,10 @@ HideToTray(hwnd, batchMode := false, batchId := 0, batchRank := 0
             ; Do not call ITaskbarList::DeleteTab for Explorer: that COM service
             ; is implemented by the desktop shell and was the remaining direct
             ; cross-process shell manipulation in the previous safe path.
-            if batchMode {
-                ; ShowWindow(SW_HIDE) is synchronous and does not incur AHK's
-                ; built-in post-window-command delay.
-                DllCall("User32\ShowWindow", "Ptr", hwnd, "Int", 0)
-            } else {
-                try WinHide("ahk_id " hwnd)
-                catch {
-                    if announceFailure {
-                        SayQuietFinal("unable to hide window")
-                        speechHandedOff := true
-                    } else {
-                        Nope()
-                    }
-                    return
-                }
-                Sleep 80
-            }
+            ; ShowWindow(SW_HIDE) is synchronous and avoids AutoHotkey's
+            ; per-window command delay.  The visibility check immediately below
+            ; is the success test for both batch and single-window hides.
+            DllCall("User32\ShowWindow", "Ptr", hwnd, "Int", 0)
             if DllCall("User32\IsWindowVisible", "Ptr", hwnd) {
                 try WinShow("ahk_id " hwnd)
                 if (!batchMode && announceFailure) {
@@ -1794,21 +1835,10 @@ HideToTray(hwnd, batchMode := false, batchId := 0, batchRank := 0
                 return
             }
         } else {
-            if batchMode {
-                DllCall("User32\ShowWindow", "Ptr", hwnd, "Int", 0)
-            } else {
-                try WinHide("ahk_id " hwnd)
-                catch {
-                    if announceFailure {
-                        SayQuietFinal("unable to hide window")
-                        speechHandedOff := true
-                    } else {
-                        Nope()
-                    }
-                    return
-                }
-                Sleep 60
-            }
+            ; Use the same synchronous no-delay hide for single-window and
+            ; batch paths.  If a window refuses SW_HIDE, the existing minimize
+            ; fallback below remains unchanged.
+            DllCall("User32\ShowWindow", "Ptr", hwnd, "Int", 0)
             if DllCall("User32\IsWindowVisible", "Ptr", hwnd) {
                 try WinMinimize("ahk_id " hwnd)
                 if !WaitForMinimized(hwnd, 700) {
@@ -1853,8 +1883,10 @@ HideToTray(hwnd, batchMode := false, batchId := 0, batchRank := 0
             return
         }
 
-        SaveHidden()
-        RefreshTray()
+        ; Persistence and tray rebuilding are not on the critical focus/speech
+        ; path.  The in-memory g_Hidden stack is already authoritative, so hand
+        ; NVDA the newly exposed window first and flush disk/tray state on the
+        ; next AHK message-loop turn.
 
         ; Move focus away while NVDA is already quiet, then explicitly include
         ; that destination after the hide result. Native focus chatter remains
@@ -1862,13 +1894,21 @@ HideToTray(hwnd, batchMode := false, batchId := 0, batchRank := 0
         nextHwnd := FocusNextWindow(hwnd)
         if nextHwnd {
             nextFocus := FocusedWindowAnnouncement(nextHwnd)
-            ; Destination applications can emit their full focus ancestry
-            ; immediately after taking foreground. Use the deferred hide
-            ; channel for every explicit hide so the result and its quiet tail
-            ; finish before destination-control chatter is allowed.
-            SayDeferredHideFinal(proc " hidden. " nextFocus, 1200)
+            nextPid := 0
+            try nextPid := WinGetPID("ahk_id " nextHwnd)
+            ; The hidden window contributes only "<app> hidden". The title and
+            ; focused-control speech that follow belong to the newly exposed
+            ; window identified by nextHwnd/nextPid. Send MTHIDEFOCUS while the
+            ; pre-hide guard is still held so there is no gap in which a browser
+            ; can auto-switch mode or start page-load Say All. The NVDA plugin's
+            ; target-specific transaction then overlaps the guard before release.
+            SayDeferredHideFocus(proc " hidden. " nextFocus, nextHwnd, nextPid, 1200)
+            EndNvdaModeGuard(modeGuardToken)
+            modeGuardToken := 0
         } else {
             FocusDesktop()
+            EndNvdaModeGuard(modeGuardToken)
+            modeGuardToken := 0
             ; Desktop focus emits a late burst of Explorer accessibility events.
             ; Let NVDA cancel those events on its own main thread, then speak the
             ; final-window result on the next event-loop turn. This mirrors the
@@ -1876,8 +1916,13 @@ HideToTray(hwnd, batchMode := false, batchId := 0, batchRank := 0
             SayDeferredHideFinal(proc " hidden. desktop list")
         }
         speechHandedOff := true
+        SetTimer(FinalizeSingleHideState, -1)
     } finally {
         EndTransition(hwnd)
+        if modeGuardToken {
+            EndNvdaModeGuard(modeGuardToken)
+            modeGuardToken := 0
+        }
 
         ; Any failed/aborted single-hide path must reopen NVDA immediately. A
         ; successful single hide hands ownership to its protected final
@@ -1893,6 +1938,15 @@ HideToTray(hwnd, batchMode := false, batchId := 0, batchRank := 0
         ; window was committed to g_Hidden. Never leave an untracked window.
         if (!recorded && taskbarRemoved && WinExist("ahk_id " hwnd))
             TaskbarTab(hwnd, true)
+    }
+}
+
+FinalizeSingleHideState(*) {
+    try {
+        SaveHidden()
+        RefreshTray()
+    } catch Error as err {
+        DebugException("Deferred single-hide finalization failed", err)
     }
 }
 
@@ -1957,8 +2011,13 @@ FocusDesktop() {
 ; topmost first, so the first eligible one is what Alt+Tab would have picked.
 ; Returns its hwnd, or 0 if there was nothing to move to.
 FocusNextWindow(skip) {
-    ; A normal minimize often transfers foreground by itself. Reuse that result
-    ; instead of generating a second activation/focus storm.
+    ; A hidden foreground window often leaves GetForegroundWindow pointing at
+    ; the old HWND briefly. The previous implementation waited up to 500 ms for
+    ; WinWaitActive after every candidate activation, and the log showed that
+    ; full timeout was being paid on nearly every Shift+Escape. Use a native,
+    ; bounded foreground handoff instead: normally this completes in one message
+    ; turn; the attached-input fallback is still limited to a few milliseconds.
+
     fg := DllCall("User32\GetForegroundWindow", "Ptr")
     if (fg && fg != skip && !IsOwnWindow(fg) && !FindHidden(fg)
             && IsAltTabWindow(fg)) {
@@ -1971,19 +2030,85 @@ FocusNextWindow(skip) {
             continue
         if !IsAltTabWindow(hwnd)
             continue
-        try {
-            WinActivate("ahk_id " hwnd)
-            WinWaitActive("ahk_id " hwnd, , 0.5)
-        }
-        actual := DllCall("User32\GetForegroundWindow", "Ptr")
-        if (actual && actual != skip && !IsOwnWindow(actual)
-                && !FindHidden(actual) && IsAltTabWindow(actual)) {
-            DebugLog("Focus handoff selected: " DebugWindow(actual), "DEBUG")
-            return actual
+
+        if FastActivateForHide(hwnd, skip) {
+            actual := DllCall("User32\GetForegroundWindow", "Ptr")
+            if (actual && actual != skip && !IsOwnWindow(actual)
+                    && !FindHidden(actual) && IsAltTabWindow(actual)) {
+                DebugLog("Focus handoff selected: " DebugWindow(actual), "DEBUG")
+                return actual
+            }
         }
     }
     DebugLog("Focus handoff found no eligible window; desktop fallback", "DEBUG")
     return 0
+}
+
+FastActivateForHide(hwnd, skip := 0) {
+    if (!hwnd || !WinExist("ahk_id " hwnd))
+        return false
+
+    ; If the next Alt+Tab candidate is minimized, restore it synchronously.
+    ; Visible candidates skip this entirely.
+    mm := 0
+    try mm := WinGetMinMax("ahk_id " hwnd)
+    if (mm = -1)
+        DllCall("User32\ShowWindow", "Ptr", hwnd, "Int", 9) ; SW_RESTORE
+
+    ; First try the cheap native foreground request.
+    DllCall("User32\BringWindowToTop", "Ptr", hwnd)
+    DllCall("User32\SetForegroundWindow", "Ptr", hwnd)
+    Loop 4 {
+        actual := DllCall("User32\GetForegroundWindow", "Ptr")
+        if (actual = hwnd)
+            return true
+        if (actual && actual != skip && !IsOwnWindow(actual)
+                && !FindHidden(actual) && IsAltTabWindow(actual))
+            return true
+        Sleep 4
+    }
+
+    ; Bounded attached-input fallback for Windows foreground-lock cases. Unlike
+    ; WinWaitActive, this never burns a fixed 500 ms timeout.
+    currentThread := DllCall("Kernel32\GetCurrentThreadId", "UInt")
+    targetThread := DllCall("User32\GetWindowThreadProcessId"
+        , "Ptr", hwnd, "Ptr", 0, "UInt")
+    foreground := DllCall("User32\GetForegroundWindow", "Ptr")
+    foregroundThread := foreground ? DllCall("User32\GetWindowThreadProcessId"
+        , "Ptr", foreground, "Ptr", 0, "UInt") : 0
+    attachedTarget := false, attachedForeground := false
+
+    try {
+        if (targetThread && targetThread != currentThread)
+            attachedTarget := !!DllCall("User32\AttachThreadInput"
+                , "UInt", currentThread, "UInt", targetThread, "Int", true)
+        if (foregroundThread && foregroundThread != currentThread
+                && foregroundThread != targetThread)
+            attachedForeground := !!DllCall("User32\AttachThreadInput"
+                , "UInt", currentThread, "UInt", foregroundThread, "Int", true)
+
+        DllCall("User32\BringWindowToTop", "Ptr", hwnd)
+        DllCall("User32\SetForegroundWindow", "Ptr", hwnd)
+        DllCall("User32\SetActiveWindow", "Ptr", hwnd)
+    } finally {
+        if attachedForeground
+            DllCall("User32\AttachThreadInput"
+                , "UInt", currentThread, "UInt", foregroundThread, "Int", false)
+        if attachedTarget
+            DllCall("User32\AttachThreadInput"
+                , "UInt", currentThread, "UInt", targetThread, "Int", false)
+    }
+
+    Loop 6 {
+        actual := DllCall("User32\GetForegroundWindow", "Ptr")
+        if (actual = hwnd)
+            return true
+        if (actual && actual != skip && !IsOwnWindow(actual)
+                && !FindHidden(actual) && IsAltTabWindow(actual))
+            return true
+        Sleep 4
+    }
+    return false
 }
 
 FocusedWindowAnnouncement(hwnd) {
@@ -2589,7 +2714,7 @@ RequestNvdaSavedFocusRestore(e) {
 }
 
 RestoreOne(hwnd, announceWindow := false, *) {
-    global g_Hidden, SPEECH_SETTLE, g_FocusBridgeGui
+    global g_Hidden, SPEECH_SETTLE, g_FocusBridgeGui, NATIVE_RESTORE_HANDOFF_SETTLE
     startedAt := A_TickCount
     DebugLog("RestoreOne requested: hwnd=" hwnd " hiddenCount=" g_Hidden.Length, "INFO")
     if !(i := FindHidden(hwnd)) {
@@ -2599,14 +2724,34 @@ RestoreOne(hwnd, announceWindow := false, *) {
 
     e := g_Hidden[i]
     DebugLog("RestoreOne target: app=" e.proc " title=" e.title " method=" e.how, "DEBUG")
-    StartQuiet(SPEECH_SETTLE + 500)
 
-    ; The tray popup has finished its callback by the time this runs. Cross the
-    ; off-screen bridge once, reveal through direct Win32 calls, and activate
-    ; without AutoHotkey's WinShow/WinRestore/WinWaitActive post-command delays.
+    ; Keep every MiniTray-owned side effect behind the quiet gate. The hidden
+    ; focus bridge makes the upcoming target activation a genuine cross-window
+    ; foreground/focus transition instead of a repeated SetFocus on an object
+    ; NVDA may already consider focused.
+    StartQuiet(SPEECH_SETTLE + 500)
     bridgePrimed := PrimeBatchFocusBridge()
     RevealBatchFast(e)
     Forget(hwnd)
+
+    ; Finish persistence/tray reflow *before* handing focus back to the app.
+    ; Once speech is reopened, target activation is the final focus-affecting
+    ; operation and NVDA owns the resulting foreground/gainFocus speech natively.
+    try {
+        SaveHidden()
+        ; If this was the final hidden window, hide the icon now while the
+        ; focus bridge and MTQUIET still own the transition. A delayed hide
+        ; after target activation lets Explorer move accessibility focus to the
+        ; next tray icon (for example Network) and creates post-restore chatter.
+        RefreshTray(true)
+    } catch Error as err {
+        DebugException("Native individual restore finalization failed", err)
+    }
+
+    EndQuiet()
+    SignalNativeNvdaRestore(e)
+    Sleep NATIVE_RESTORE_HANDOFF_SETTLE
+
     activated := ActivateEntryBatchFast(e)
     if (!activated)
         activated := ForceForegroundWindow(e.hwnd, 0.06)
@@ -2615,32 +2760,11 @@ RestoreOne(hwnd, announceWindow := false, *) {
     if IsObject(g_FocusBridgeGui)
         try g_FocusBridgeGui.Hide()
 
-    ; Physical focus is now restored. Submit the title and focused-control
-    ; report through one callback-free NVDA sequence. This bypasses the old
-    ; SPEECH_SETTLE and notification-icon wait while the quiet tail still covers
-    ; the deferred tray reflow.
-    SayDeferredRestoreFinal("restored " e.title, e, 1500)
-    SetTimer(FinalizeRestoreOneFast.Bind(startedAt, e, bridgePrimed, activated), -1)
-
-    DebugLog("RestoreOne handed off: hwnd=" hwnd
-        " foreground=" DllCall("User32\GetForegroundWindow", "Ptr")
-        " elapsedMs=" (A_TickCount - startedAt), "INFO")
-}
-
-FinalizeRestoreOneFast(startedAt, e, bridgePrimed, activated, *) {
-    global g_Hidden
-    try {
-        SaveHidden()
-        RefreshTray()
-    } catch Error as err {
-        DebugException("Deferred individual restore finalization failed", err)
-    }
-    DebugLog("RestoreOne completed: hwnd=" e.hwnd
-        " remainingHidden=" g_Hidden.Length
+    DebugLog("RestoreOne native handoff completed: hwnd=" hwnd
         " bridgePrimed=" bridgePrimed
         " activated=" activated
-        " elapsedMs=" (A_TickCount - startedAt)
-        " title=" e.title, "INFO")
+        " foreground=" DllCall("User32\GetForegroundWindow", "Ptr")
+        " elapsedMs=" (A_TickCount - startedAt), "INFO")
 }
 
 CloseOne(
@@ -2671,28 +2795,54 @@ CloseOne(
 }
 
 RestoreGroup(proc, *) {
-    global g_Hidden, g_Restoring
+    global g_Hidden, g_Restoring, g_FocusBridgeGui, NATIVE_RESTORE_HANDOFF_SETTLE
     DebugLog("RestoreGroup requested: app=" proc " hiddenCount=" g_Hidden.Length, "INFO")
-    StartQuiet()
-    g_Restoring := true
-    last := 0
+
+    matches := []
     for e in g_Hidden.Clone() {
-        if (e.proc = proc) {
-            Reveal(e, false, false)
-            last := e
-        }
+        if (e.proc = proc)
+            matches.Push(e)
+    }
+    if (!matches.Length) {
+        EndQuiet()
+        return
+    }
+
+    StartQuiet()
+    last := matches[matches.Length]
+    g_Restoring := true
+    for i, e in matches {
+        if (i = matches.Length)
+            continue
+        RevealBatchFast(e)
     }
     g_Restoring := false
+
+    bridgePrimed := PrimeBatchFocusBridge()
+    RevealBatchFast(last)
     ForgetProc(proc)
-    SaveHidden(), RefreshTray()
-    if last {
-        ActivateEntryNow(last)
-        RequestNvdaSavedFocusRestore(last)
-        SayAfterTrayChange("restored " last.title)
-    } else {
-        EndQuiet()
+    try {
+        SaveHidden()
+        RefreshTray(true)
+    } catch Error as err {
+        DebugException("Native group restore finalization failed", err)
     }
-    DebugLog("RestoreGroup completed: app=" proc " remainingHidden=" g_Hidden.Length, "INFO")
+
+    EndQuiet()
+    SignalNativeNvdaRestore(last)
+    Sleep NATIVE_RESTORE_HANDOFF_SETTLE
+    activated := ActivateEntryBatchFast(last)
+    if (!activated)
+        activated := ForceForegroundWindow(last.hwnd, 0.06)
+    if activated
+        RememberUserForeground(last.hwnd)
+    if IsObject(g_FocusBridgeGui)
+        try g_FocusBridgeGui.Hide()
+
+    DebugLog("RestoreGroup native handoff completed: app=" proc
+        " remainingHidden=" g_Hidden.Length
+        " bridgePrimed=" bridgePrimed
+        " activated=" activated, "INFO")
 }
 
 CloseGroup(
@@ -2834,14 +2984,14 @@ BuildRestoreAllOrder(entries) {
 }
 
 RestoreEverything(saySummary) {
-    global g_Hidden, g_Restoring, g_Cfg, g_FocusBridgeGui
+    global g_Hidden, g_Restoring, g_Cfg, g_FocusBridgeGui, NATIVE_RESTORE_HANDOFF_SETTLE
     startedAt := A_TickCount
     DebugLog("RestoreEverything requested: count=" g_Hidden.Length
-        " saySummary=" saySummary, "INFO")
-    ; Nothing to restore: say so and get out WITHOUT going quiet. There is no
-    ; focus change coming and no deferred line of ours to protect, so opening a
-    ; quiet window here would only mute the screen reader -- which is what
-    ; swallowed an NVDA command pressed straight afterwards.
+        " nativeHandoff=1", "INFO")
+
+    ; No foreground change will occur when there is nothing to restore, so the
+    ; ordinary explicit result remains useful here. Successful restores below
+    ; deliberately have no MiniTray-authored speech at all.
     if (!g_Hidden.Length) {
         if (saySummary) {
             StartQuiet(700)
@@ -2853,17 +3003,13 @@ RestoreEverything(saySummary) {
         return
     }
 
-    ; Before any reveal: each one is a focus change the reader announces, and
-    ; going quiet after the fact only truncates the first of them.
     StartQuiet()
     entries := BuildRestoreAllOrder(g_Hidden.Clone())
     n := entries.Length
     last := n ? entries[n] : 0
-    quiet := last ? StillFocused(last.hwnd) : false
 
-    ; Restore ordinary records in hide order, but reverse each hide-all batch.
-    ; A batch is therefore shown bottom-to-top, recreating its original Alt+Tab
-    ; chain and activating its original foreground window last.
+    ; Reveal every non-final window without activation so neither Windows nor
+    ; NVDA has to process a chain of intermediate foreground changes.
     g_Restoring := true
     for i, e in entries {
         if (i = n)
@@ -2872,68 +3018,49 @@ RestoreEverything(saySummary) {
     }
     g_Restoring := false
 
-    ; The in-memory stack is authoritative immediately. Disk persistence and
-    ; tray rebuilding happen after the result has already been handed to NVDA.
     g_Hidden := []
+    bridgePrimed := false
     if last {
-        ; Cross through MiniTray's focus bridge before revealing and activating
-        ; the original foreground window. Intermediate windows were restored
-        ; without activation, preserving both speed and the Alt+Tab chain.
+        ; Cross the hidden bridge, reveal the intended final foreground window
+        ; without activating it, then complete all MiniTray-owned tray/disk work
+        ; while NVDA is still quiet and the bridge still owns foreground.
         bridgePrimed := PrimeBatchFocusBridge()
         RevealBatchFast(last)
-        ActivateEntryBatchFast(last)
+    }
+
+    try {
+        SaveHidden()
+        RefreshTray(true)
+    } catch Error as err {
+        DebugException("Native restore-all finalization failed", err)
+    }
+
+    if last {
+        ; This is the handoff boundary. No custom restore title/focus sequence,
+        ; cache replay, browser guard, or delayed focus report follows it.
+        EndQuiet()
+        ; Ctrl+Shift+L restores the entire stack. Let the NVDA plugin prepend
+        ; this result to the same deterministic title/focus sequence so no
+        ; separate utterance can be interrupted by the foreground transition.
+        SignalNativeNvdaRestore(last, saySummary ? "all windows restored" : "")
+        Sleep NATIVE_RESTORE_HANDOFF_SETTLE
+        activated := ActivateEntryBatchFast(last)
+        if (!activated)
+            activated := ForceForegroundWindow(last.hwnd, 0.06)
+        if activated
+            RememberUserForeground(last.hwnd)
         if IsObject(g_FocusBridgeGui)
             try g_FocusBridgeGui.Hide()
-        DebugLog("Restore-all final activation: hwnd=" last.hwnd
+
+        DebugLog("Restore-all native final activation: hwnd=" last.hwnd
             " bridgePrimed=" bridgePrimed
+            " activated=" activated
             " actualForeground=" DllCall("User32\GetForegroundWindow", "Ptr"), "DEBUG")
-    }
-
-    ; ONE protected sentence, spoken after final activation.
-    ;
-    ; Speaking before activating gets us cut off: focusing a window makes the
-    ; reader announce its whole ancestry (window, then document, then landmark
-    ; for a browser), and each of those cancels what came before. That burst is
-    ; NVDA's normal behaviour on any focus change -- plain Alt+Tab produces the
-    ; identical repetition -- so it cannot be prevented from here, only talked
-    ; over. Our line is deferred until the final restored window is visible and
-    ; focused. Restore-all uses a batch summary; any non-summary caller can still
-    ; fall back to the final window title when needed to cover tray reflow.
-    said := ""
-    if (last && saySummary)
-        ; Confirm the batch first, then identify the final foreground window
-        ; by its title only. Restore announcements never repeat the app name.
-        ; The plugin appends ': <focus>' and speaks the complete result in one utterance.
-        ; Individual restores retain focused-control and terminal follow-up.
-        finalTitle := Trim(last.title)
-        if (finalTitle = "")
-            finalTitle := Trim(WinGetTitle("ahk_id " last.hwnd))
-        said := "all windows restored"
-        if (finalTitle != "")
-            said .= " " finalTitle
-    else if (last && quiet)
-        said := "restored " last.title
-    if (said != "") {
-        ; Restore-all uses one dedicated callback-free NVDA command. The plugin
-        ; silently repairs its focus/foreground caches first, then speaks this
-        ; complete title and focused-control report in one speech sequence.
-        if (last && saySummary)
-            SayDeferredRestoreFinal(said, last, 1500)
-        else
-            SayQuietFinal(said, 2200)
     } else {
-        EndQuiet()                       ; nothing to say, so re-open the floor
+        EndQuiet()
     }
 
-    if (last && !(saySummary && said != "")) {
-        ; Individual/non-summary restores retain the richer focused-control,
-        ; Edge virtual-caret, and terminal-prompt recovery.
-        SetTimer(RequestNvdaSavedFocusRestore.Bind(last), -1)
-    }
-
-    ; Do not hold up the visible result or its speech for INI and tray work.
-    SetTimer(FinalizeRestoreAllBatch.Bind(startedAt, n), -1)
-    DebugLog("RestoreEverything handed off: restored=" n
+    DebugLog("RestoreEverything native handoff completed: restored=" n
         " foreground=" DllCall("User32\GetForegroundWindow", "Ptr")
         " elapsedMs=" (A_TickCount - startedAt), "INFO")
 }
@@ -3147,6 +3274,9 @@ GroupByProcess() {
 ;                                          speak text, then post focus callback
 ;       Chr(1) "MTREPORTLINE:hwnd:pid" Chr(1)
 ;                                          ask NVDA to read the focused caret line
+;       Chr(1) "MTNATIVERESTORE:hwnd:pid" Chr(1)
+;                                          release MiniTray speech ownership; the
+;                                          next real activation is native NVDA
 ;
 ;   The plugin never voices the control sentinels. MTFINAL is the one exception:
 ;   its payload is spoken through the original NVDA speech function while the
@@ -3218,8 +3348,8 @@ SendQuiet(ms) {
 ; The popup's keyboard gestures are implemented as AHK hotkeys, so NVDA does
 ; not receive AppsKey, Up, Down, Left or Right through its normal input hook.
 ; Tell conceptSphereQuiet explicitly that genuine popup navigation is about to
-; occur. It can then cancel only the protected "MiniTray menu" phrase and let
-; the new ListBox item speak immediately.
+; occur. It can then cancel only the protected opening item phrase and let
+; the newly navigated ListBox item speak immediately.
 ReleasePopupSpeech() {
     Announce(Chr(1) "MTNAV" Chr(1), false)
 }
@@ -3267,11 +3397,11 @@ SendCloseTrayResult(text, removeIcon) {
 CompleteDeferredTrayIconHide(wParam := 0, lParam := 0, msg := 0, hwnd := 0) {
     global g_Hidden, g_Cfg
     if (!g_Hidden.Length && g_Cfg.Get("HideIconWhenEmpty", "0") = "1") {
-        A_IconHidden := true
-        DebugLog("Deferred MiniTray icon removal completed after tray focus moved", "INFO")
+        MTIcon_SetHidden(true, "deferred hide: list empty")
+        DebugLog("Deferred MiniTray icon hide completed after tray focus moved", "INFO")
     } else {
-        A_IconHidden := false
-        DebugLog("Deferred MiniTray icon removal skipped; icon still required", "DEBUG")
+        MTIcon_SetHidden(false, "deferred hide skipped: icon still required")
+        DebugLog("Deferred MiniTray icon hide skipped; icon still required", "DEBUG")
     }
     return 0
 }
@@ -3306,10 +3436,37 @@ SayQuietFinal(text, tailMs := -1, cancel := false) {
     SetTimer(EndQuiet, -tailMs)
 }
 
+; Arm NVDA before a single-window hide can transfer foreground. This prevents
+; a browser revealed underneath from automatically switching between browse and
+; focus mode merely because MiniTray moved Windows focus. The plugin reference-
+; counts this guard with its existing browser restore guard, so rapid queued
+; hide/restore actions cannot restore the user's settings too early.
+BeginNvdaModeGuard(timeoutMs := 0) {
+    global g_NvdaModeGuardSerial, g_Cfg
+    global NVDA_MODE_GUARD_SETTLE, NVDA_MODE_GUARD_TIMEOUT
+
+    if (g_Cfg.Get("QuietPlugin", "1") != "1")
+        return 0
+    if !timeoutMs
+        timeoutMs := NVDA_MODE_GUARD_TIMEOUT
+
+    token := g_NvdaModeGuardSerial
+    g_NvdaModeGuardSerial := (g_NvdaModeGuardSerial >= 0x7FFFFFFE) ? 1 : g_NvdaModeGuardSerial + 1
+    Announce(Chr(1) "MTMODEGUARD:" token ":" timeoutMs Chr(1), false)
+    Sleep NVDA_MODE_GUARD_SETTLE
+    return token
+}
+
+EndNvdaModeGuard(token) {
+    if !token
+        return
+    Announce(Chr(1) "MTMODEGUARD:" token ":0" Chr(1), false)
+}
+
 ; The desktop is unusually noisy after the last ordinary window is hidden.
-; MTHIDEFINAL is handled inside NVDA: it cancels late desktop focus speech,
-; waits one NVDA event-loop turn, and then speaks this result while keeping
-; the quiet tail active.
+; MTHIDEFINAL is retained for desktop/hide-all results. Single-window hides
+; that expose another real window use MTHIDEFOCUS instead, passing that window's
+; HWND/PID so NVDA can append its focused control deterministically.
 SayDeferredHideFinal(text, tailMs := 1000) {
     global g_QuietUntil, g_Cfg
 
@@ -3329,7 +3486,33 @@ SayDeferredHideFinal(text, tailMs := 1000) {
     SetTimer(EndQuiet, -tailMs)
 }
 
-; Restore-all uses a dedicated plugin command rather than MTFINALFOCUS.
+; Single-window hide handoff. ``text`` already contains
+;     <hidden app> hidden. <newly exposed title>
+; and targetHwnd/targetPid identify ONLY the newly exposed window. NVDA uses
+; those identifiers to append that window's focused control after a fixed gap.
+SayDeferredHideFocus(text, targetHwnd, targetPid, tailMs := 1200) {
+    global g_QuietUntil, g_Cfg
+
+    if (g_Cfg.Get("Speak", "0") != "1") {
+        EndQuiet()
+        return
+    }
+
+    if (!targetHwnd || g_Cfg.Get("QuietPlugin", "1") != "1") {
+        EndQuiet()
+        Announce(text)
+        return
+    }
+
+    g_QuietUntil := A_TickCount + tailMs
+    Announce(
+        Chr(1) "MTHIDEFOCUS:" tailMs ":" targetHwnd ":" targetPid ":" text Chr(1),
+        false
+    )
+    SetTimer(EndQuiet, -tailMs)
+}
+
+; Legacy compatibility helper. Native restore paths no longer call this.
 ; The dual-voice synthesizer can accept CallbackCommand without ever executing
 ; it, truncating the surrounding speech. MTRESTOREFINAL contains plain text
 ; only; the plugin silently fixes NVDA's caches before speaking it.
@@ -3448,7 +3631,7 @@ UpdateTrayIcon() {
 
     if (g_Hidden.Length || g_Cfg.Get("HideIconWhenEmpty", "0") != "1") {
         tries := 0
-        A_IconHidden := false
+        MTIcon_SetHidden(false, "windows hidden, or hide-when-empty off")
         FlushPendingSay()                ; nothing was removed; no need to wait
         return
     }
@@ -3460,7 +3643,7 @@ UpdateTrayIcon() {
         return
     }
     tries := 0
-    A_IconHidden := true
+    MTIcon_SetHidden(true, "list empty, tray focus clear")
     if (g_PendingSay != "")
         SetTimer(FlushPendingSay, -ANNOUNCE_AFTER_HIDE)
 }
@@ -3564,8 +3747,8 @@ TrayIconMsg(wParam, lParam, msg, hwnd) {
     DebugLog("Tray icon notification: event=0x" Format("{:04X}", event), "DEBUG")
 
     ; Open the application list immediately. No double-click interval or
-    ; accessibility-settle timer is allowed to delay the popup or its explicit
-    ; "MiniTray menu" announcement.
+    ; accessibility-settle timer is allowed to delay the popup or its directly
+    ; focused first-item announcement.
     if (event = WM_RBUTTONUP) {
         BeginTrayPopupOpen()
         return 0
@@ -3746,7 +3929,7 @@ BeginTrayPopupOpen(*) {
 }
 
 ShowTrayPopup(*) {
-    global g_PopupGui, g_PopupLB, g_PopupProc, g_PopupMode, POPUP_OPEN_SETTLE
+    global g_PopupGui, g_PopupLB, g_PopupItems, g_PopupProc, g_PopupMode, POPUP_OPEN_SETTLE
     global g_PopupContextHwnd, g_PopupContextParent
     if !g_PopupGui
         BuildTrayPopup()
@@ -3754,7 +3937,12 @@ ShowTrayPopup(*) {
     g_PopupMode := "browse"
     g_PopupContextHwnd := 0
     g_PopupContextParent := ""
-    FillTrayPopup(0)                     ; focus the list, but select no row yet
+    FillTrayPopup(0)                     ; populate without emitting MTNAV
+    ; The popup should open directly on row 1. Select it while the ListBox is
+    ; still hidden so no intermediate accessibility announcement escapes before
+    ; the MTMENU transport takes ownership of the opening presentation.
+    if g_PopupItems.Length
+        g_PopupLB.Choose(1)
 
     ; Size it first, then place it near the pointer, clamped to the work area.
     CoordMode "Mouse", "Screen"
@@ -3771,7 +3959,7 @@ ShowTrayPopup(*) {
 }
 
 AnnounceTrayPopupOpened() {
-    global g_PopupGui, g_PopupOpening, APP_NAME, POPUP_OPEN_TAIL
+    global g_PopupGui, g_PopupLB, g_PopupOpening, APP_NAME, POPUP_OPEN_TAIL
     g_PopupOpening := false
     if (!IsObject(g_PopupGui)
         || !DllCall("User32\IsWindowVisible", "Ptr", g_PopupGui.Hwnd)
@@ -3780,12 +3968,21 @@ AnnounceTrayPopupOpened() {
         EndQuiet()
         return
     }
-    DebugLog("Sending deferred MiniTray menu announcement", "DEBUG")
-    ; Use a dedicated command rather than MTFINAL. conceptSphereQuiet receives
-    ; this after the ListBox focus events, cancels any speech inside NVDA, waits
-    ; one short NVDA event-loop turn, and then speaks through the original
-    ; speech function while the quiet gate still blocks late focus chatter.
-    Announce(Chr(1) "MTMENU:" POPUP_OPEN_TAIL ":" APP_NAME " menu" Chr(1), false)
+
+    ; MTMENU now carries the already-selected first row, not the container name.
+    ; The NVDA plugin speaks this text exactly once while suppressing the popup's
+    ; native dialog/list/selection-state chatter. This makes AppsKey/right-click
+    ; land directly on e.g. "Microsoft Teams menu".
+    firstItem := ""
+    try firstItem := Trim(g_PopupLB.Text)
+    if (firstItem = "") {
+        ; Compatibility fallback. A current plugin can recover the focused row
+        ; natively when the payload is empty; never fall back to "MiniTray menu".
+        DebugLog("Tray popup first-item text unavailable; sending empty MTMENU payload", "WARN")
+    } else {
+        DebugLog("Sending tray popup first-item announcement: " firstItem, "DEBUG")
+    }
+    Announce(Chr(1) "MTMENU:" POPUP_OPEN_TAIL ":" firstItem Chr(1), false)
 }
 
 BuildTrayPopup() {
@@ -3877,8 +4074,8 @@ PopupEscape(*) {
     HideTrayPopup()
 }
 
-; Rebuild the current level. selectIndex=0 deliberately leaves the ListBox
-; without a selected item; this is used only when the tray popup first opens.
+; Rebuild the current level. selectIndex=0 suppresses the MTNAV transport;
+; the initial-open path selects row 1 itself while the ListBox is still hidden.
 ;
 ; Top level: single hidden windows or multi-window app menus, then Settings.
 ; There is no placeholder row when nothing is hidden, so Settings is then the
@@ -3953,8 +4150,8 @@ FillTrayPopup(selectIndex := 1, selectProc := "", selectHwnd := 0) {
         " rows=" rows.Length, "DEBUG")
 
     ; Returning from a context level reselects its parent window/application.
-    ; Initial opening passes zero, so NVDA hears only "MiniTray menu" until
-    ; the user presses Up or Down.
+    ; Initial opening passes zero here only to avoid MTNAV; ShowTrayPopup then
+    ; selects row 1 while the ListBox is hidden before focus enters the popup.
     if (selectProc != "" || selectHwnd) {
         for idx, it in g_PopupItems {
             if (selectHwnd && it.hwnd = selectHwnd) {
@@ -3991,15 +4188,28 @@ PopupClearSelection() {
 ; from an intentionally unselected popup: Down -> first; Up -> last.
 PopupMove(direction, *) {
     global g_PopupLB, g_PopupItems, g_PopupProc, g_PopupMode
-    ; A deliberate user action may interrupt the opening phrase and must never
-    ; have its resulting item announcement swallowed by the protective tail.
-    ReleasePopupSpeech()
-    EndQuiet()
     if (!g_PopupLB || !g_PopupItems.Length)
         return
 
-
     idx := g_PopupLB.Value
+
+    ; With nothing hidden the top level contains only Settings. Up/Down cannot
+    ; actually move anywhere, so do not re-Choose(1): doing so generates a new
+    ; ListBox focus event and makes NVDA repeat "Settings" on every key press.
+    ; Keep the protected opening phrase intact as well; a no-op navigation key
+    ; should be completely silent.
+    if (g_PopupItems.Length = 1 && idx = 1) {
+        DebugLog("Tray popup singleton navigation ignored: kind="
+            g_PopupItems[1].kind, "DEBUG")
+        return
+    }
+
+    ; A deliberate user action that really changes selection may interrupt the
+    ; opening phrase and must never have its resulting item announcement
+    ; swallowed by the protective tail.
+    ReleasePopupSpeech()
+    EndQuiet()
+
     if (!idx)
         idx := (direction > 0) ? 1 : g_PopupItems.Length
     else {
@@ -4151,7 +4361,7 @@ PopupCloseKeepOpen(action, returnProc := "", preferredIndex := 1, *) {
     ; icon before posting WM_MT_HIDE_ICON back to this script.
     SetTimer(UpdateTrayIcon, 0)
     A_IconTip := APP_NAME
-    A_IconHidden := false
+    MTIcon_SetHidden(false, "popup close: keep icon until focus settles")
 
     if g_Hidden.Length {
         g_PopupMode := "browse"
@@ -4412,18 +4622,26 @@ PopupOpenKeyboardContext(*) {
 
 ; Updates the tray icon, and the popup if it happens to be open. Named for what
 ; it does now -- there is no menu left to build.
-RefreshTray() {
+RefreshTray(hideEmptyNow := false) {
     global g_Hidden, g_Cfg, APP_NAME, g_PopupGui, ICON_HIDE_DELAY
 
     A_IconTip := APP_NAME                             ; constant, always
 
-    ; Showing the icon is harmless at any moment. REMOVING it is not: deleting a
-    ; notification-area icon makes the shell reflow that toolbar, and a screen
-    ; reader then re-reads every remaining icon.
-    if (g_Hidden.Length || g_Cfg.Get("HideIconWhenEmpty", "0") != "1")
-        A_IconHidden := false
-    else
+    ; Showing the icon is harmless at any moment. Hiding it makes Explorer
+    ; reflow the notification area and can move accessibility focus to the next
+    ; icon. Ordinary refreshes therefore keep the existing delayed/focus-aware
+    ; path. Restore/save transactions may request an immediate hide while their
+    ; quiet/focus handoff is still active, so the real destination window can be
+    ; the final focus event instead of a neighboring tray icon.
+    if (g_Hidden.Length || g_Cfg.Get("HideIconWhenEmpty", "0") != "1") {
+        SetTimer(UpdateTrayIcon, 0)
+        MTIcon_SetHidden(false, "refresh: icon required")
+    } else if hideEmptyNow {
+        SetTimer(UpdateTrayIcon, 0)
+        MTIcon_SetHidden(true, "refresh: immediate empty hide inside quiet focus handoff")
+    } else {
         SetTimer(UpdateTrayIcon, -ICON_HIDE_DELAY)
+    }
 
     if (g_PopupGui && DllCall("User32\IsWindowVisible", "Ptr", g_PopupGui.Hwnd))
         FillTrayPopup()
@@ -4668,7 +4886,7 @@ LoadOptionsIntoGui() {
 }
 
 SaveOptionsFromGui() {
-    global g_MainGui, g_Cfg, INI_FILE, CFG_SEC
+    global g_MainGui, g_Cfg, g_Hidden, INI_FILE, CFG_SEC
     if !g_MainGui
         return
     set := Map("SoundMode",       g_MainGui["OptSound"].Text
@@ -4683,12 +4901,22 @@ SaveOptionsFromGui() {
         IniWrite(v, INI_FILE, CFG_SEC, k)
         g_Cfg[k] := v . ""
     }
-    ; Act on the new settings now. HideIconWhenEmpty is only ever evaluated in
-    ; RefreshTray(), which otherwise runs on hide/restore/close/prune -- so with
-    ; nothing hidden, toggling it here would have had no visible effect at all
-    ; until the next time a window was hidden and restored.
-    RefreshTray()
-    DebugLog("Options saved: SoundMode=" g_Cfg.Get("SoundMode", "")
+
+    ; Save is also the Options dialog's accept action. If the new setting hides
+    ; an empty tray icon, perform that shell reflow while MiniTray still owns
+    ; foreground and while MTQUIET can absorb the transient tray focus event.
+    ; Hiding the GUI immediately afterwards makes the underlying application the
+    ; final native focus destination instead of the next notification-area icon.
+    hideEmptyNow := (!g_Hidden.Length
+        && g_Cfg.Get("HideIconWhenEmpty", "0") = "1")
+    if hideEmptyNow
+        StartQuiet(700, false)
+    RefreshTray(hideEmptyNow)
+    g_MainGui.Hide()
+    if hideEmptyNow
+        SetTimer(EndQuiet, -250)
+
+    DebugLog("Options saved and window hidden: SoundMode=" g_Cfg.Get("SoundMode", "")
         " Speak=" g_Cfg.Get("Speak", "0")
         " ConfirmCloseAll=" g_Cfg.Get("ConfirmCloseAll", "1")
         " AutoApply=" g_Cfg.Get("AutoApply", "1")
@@ -5188,6 +5416,259 @@ HandleExit(reason, code) {
     }
     g_Hidden := []
     try IniDelete(INI_FILE, HID_SEC)
-    DebugLog("MiniTray shutdown complete", "INFO")
+
+    ; Do not send Shell_NotifyIcon(NIM_DELETE) during shutdown. Explorer has
+    ; repeatedly fail-fasted while servicing DeleteIcon/NotificationAreaIcon2::Close.
+    ; Once this OnExit handler returns, AHK destroys A_ScriptHwnd/process state and
+    ; the shell can discard the owner registration as part of normal owner teardown.
+    MTIcon_Abandon("process exit: " reason)
+    DebugLog("MiniTray shutdown complete (no NIM_DELETE sent)", "INFO")
+    return 0
+}
+
+; =============================================================================
+;  NOTIFICATION-AREA ICON  (MTIcon_*)
+; -----------------------------------------------------------------------------
+;  MiniTray owns its tray icon directly rather than using AHK's A_IconHidden.
+;
+;  WHY. Crash dump explorer.exe.8304 (13 Aug 2026) fail-fasted here:
+;
+;      explorer!CTray::_MessageLoop
+;        -> user32!_fnCOPYDATA                    (WM_COPYDATA = Shell_NotifyIcon)
+;        -> Taskbar!TrayUI::HandleCopyData
+;        -> Taskbar!NotificationAreaIconManager2::ShellNotifyIcon
+;        -> Taskbar!NotificationAreaIconManager2::DeleteIcon      <-- NIM_DELETE
+;        -> Taskbar!...NotificationAreaIcon2::Close
+;        -> Taskbar!...registry_watcher_state::~registry_watcher_state
+;        -> Taskbar!wil::details::CloseHandle      -> FAIL FAST (E_HANDLE)
+;
+;  DeleteIcon is reached by the explicit NIM_DELETE request shown in the crash
+;  stack. A_IconHidden offers add/delete, so older hide-when-empty behavior drove
+;  that path repeatedly. Normal hiding now uses NIM_MODIFY + NIS_HIDDEN, and this
+;  build also suppresses the final shutdown NIM_DELETE. MiniTray therefore sends
+;  NIM_ADD and NIM_MODIFY only.
+;
+;  The bug is Microsoft's: Shell_NotifyIcon marshals a NOTIFYICONDATA struct
+;  over WM_COPYDATA and cannot pass a handle into explorer's heap, so the bad
+;  handle is explorer's own. MiniTray was only the trigger. This removes the
+;  trigger.
+;
+;  CONSEQUENCE OF OWNERSHIP. AHK used to re-create its own icon when the shell
+;  restarted. It will not do that for an icon we registered, so MTIcon_Init
+;  handles TaskbarCreated itself. Without that, one explorer crash would leave
+;  MiniTray running with no icon and every hidden window unreachable.
+;
+;  No top-level globals here on purpose: state lives in a lazily built object,
+;  so this block can sit anywhere in the file.
+; =============================================================================
+
+MTIcon_State() {
+    static s := ""
+    if !IsObject(s) {
+        s := { hIcon:   0
+             , added:   false
+             , hidden:  false
+             , hooked:  false
+             , uID:     1001         ; our own ID; AHK's icon is not in play
+             , seq:     0            ; monotonic tray-operation diagnostic ID
+             , buf:     "" }
+    }
+    return s
+}
+
+; One compact line per notification-area transition. This makes it possible to
+; correlate a future Explorer dump with the last MiniTray shell operation while
+; keeping the normal log small.
+MTIcon_Log(action, ok := -1, why := "") {
+    st := MTIcon_State()
+    st.seq += 1
+
+    shellPid := 0
+    try shellPid := ProcessExist("explorer.exe")
+
+    result := ""
+    level := "DEBUG"
+    if (ok != -1) {
+        result := " result=" (ok ? "ok" : "FAILED err=" A_LastError)
+        if !ok
+            level := "ERROR"
+    }
+    if (action = "ABANDON")
+        level := "INFO"
+
+    DebugLog("MTIcon seq=" st.seq
+        " action=" action
+        " pid=" ProcessExist()
+        " hwnd=" A_ScriptHwnd
+        " uid=" st.uID
+        " shellPid=" shellPid
+        " added=" st.added
+        " hidden=" st.hidden
+        . (why ? " why=" why : "")
+        . result, level)
+}
+
+; NOTIFYICONDATAW offsets, computed from A_PtrSize rather than hard-coded: the
+; struct is 976 bytes on x64 and 956 on x86, and a wrong cbSize makes
+; Shell_NotifyIcon fail silently with no useful error.
+MTIcon_Offsets() {
+    static o := ""
+    if !IsObject(o) {
+        p := A_PtrSize
+        o := {}
+        o.cbSize       := 0
+        o.hWnd         := (p = 8) ? 8 : 4
+        o.uID          := o.hWnd + p
+        o.uFlags       := o.uID + 4
+        o.uCallback    := o.uFlags + 4
+        o.hIcon        := (p = 8) ? 32 : 20      ; 8-byte realign on x64
+        o.szTip        := o.hIcon + p
+        o.dwState      := o.szTip + 256          ; szTip is WCHAR[128]
+        o.dwStateMask  := o.dwState + 4
+        o.szInfo       := o.dwStateMask + 4
+        o.uVersion     := o.szInfo + 512         ; szInfo is WCHAR[256]
+        o.szInfoTitle  := o.uVersion + 4
+        o.dwInfoFlags  := o.szInfoTitle + 128    ; szInfoTitle is WCHAR[64]
+        o.guidItem     := o.dwInfoFlags + 4
+        o.hBalloonIcon := o.guidItem + 16
+        o.size         := o.hBalloonIcon + p
+    }
+    return o
+}
+
+MTIcon_BuildNid(flags, state := 0, stateMask := 0, tip := "") {
+    st := MTIcon_State()
+    o  := MTIcon_Offsets()
+
+    if !IsObject(st.buf)
+        st.buf := Buffer(o.size, 0)
+
+    NumPut("UInt", o.size,       st.buf, o.cbSize)
+    NumPut("Ptr",  A_ScriptHwnd, st.buf, o.hWnd)
+    NumPut("UInt", st.uID,       st.buf, o.uID)
+    NumPut("UInt", flags,        st.buf, o.uFlags)
+    NumPut("UInt", 0x0404,       st.buf, o.uCallback)   ; TrayIconMsg listens here
+    NumPut("Ptr",  st.hIcon,     st.buf, o.hIcon)
+    NumPut("UInt", state,        st.buf, o.dwState)
+    NumPut("UInt", stateMask,    st.buf, o.dwStateMask)
+
+    if (tip != "") {
+        DllCall("RtlZeroMemory", "Ptr", st.buf.Ptr + o.szTip, "UPtr", 256)
+        StrPut(SubStr(tip, 1, 127), st.buf.Ptr + o.szTip, 127, "UTF-16")
+    }
+    return st.buf
+}
+
+; Mirrors the original TraySetIcon logic: when compiled, Ahk2Exe embeds
+; MiniTray.ico as the exe's main icon, so never fall back to shell32 there or a
+; good embedded icon gets replaced by a generic one.
+MTIcon_Load() {
+    cx := DllCall("GetSystemMetrics", "Int", 49, "Int")   ; SM_CXSMICON
+    cy := DllCall("GetSystemMetrics", "Int", 50, "Int")   ; SM_CYSMICON
+
+    if FileExist(ICON_FILE) {
+        h := DllCall("LoadImageW", "Ptr", 0, "Str", ICON_FILE
+            , "UInt", 1, "Int", cx, "Int", cy, "UInt", 0x10, "Ptr")   ; LR_LOADFROMFILE
+        if h
+            return h
+    }
+    if A_IsCompiled {
+        h := DllCall("shell32\ExtractIconW", "Ptr", 0, "Str", A_ScriptFullPath
+            , "UInt", 0, "Ptr")
+        if (h && h != 1)
+            return h
+    } else {
+        h := DllCall("shell32\ExtractIconW", "Ptr", 0, "Str", "shell32.dll"
+            , "UInt", 44, "Ptr")
+        if (h && h != 1)
+            return h
+    }
+    return DllCall("LoadIconW", "Ptr", 0, "Ptr", 32512, "Ptr")        ; IDI_APPLICATION
+}
+
+MTIcon_Init() {
+    st := MTIcon_State()
+
+    if !st.hooked {
+        if (m := DllCall("RegisterWindowMessage", "Str", "TaskbarCreated", "UInt")) {
+            OnMessage(m, MTIcon_OnTaskbarCreated)
+            st.hooked := true
+        }
+    }
+    return MTIcon_Add()
+}
+
+MTIcon_Add() {
+    st := MTIcon_State()
+    if st.added
+        return true
+
+    if !st.hIcon
+        st.hIcon := MTIcon_Load()
+
+    ; NIF_MESSAGE | NIF_ICON | NIF_TIP
+    nid := MTIcon_BuildNid(0x1 | 0x2 | 0x4, 0, 0, APP_NAME)
+    ok  := DllCall("shell32\Shell_NotifyIconW", "UInt", 0, "Ptr", nid, "Int")  ; NIM_ADD
+
+    st.added  := ok ? true : false
+    st.hidden := false
+
+    MTIcon_Log("NIM_ADD", ok)
+    return ok
+}
+
+; Hide/show WITHOUT deleting the registration. Idempotent: if the icon is
+; already in the requested state, nothing is sent at all.
+MTIcon_SetHidden(hide, why := "") {
+    st   := MTIcon_State()
+    hide := !!hide
+
+    if !st.added {
+        DebugLog("MTIcon SetHidden(" hide ") while not registered; adding first", "DEBUG")
+        if !MTIcon_Add()
+            return false
+    }
+    if (st.hidden = hide)
+        return true
+
+    ; dwStateMask says only the NIS_HIDDEN bit of dwState is meaningful.
+    nid := MTIcon_BuildNid(0x8, hide ? 0x1 : 0, 0x1)                  ; NIF_STATE / NIS_HIDDEN
+    ok  := DllCall("shell32\Shell_NotifyIconW", "UInt", 1, "Ptr", nid, "Int")  ; NIM_MODIFY
+
+    if ok
+        st.hidden := hide
+
+    MTIcon_Log("NIM_MODIFY " (hide ? "NIS_HIDDEN" : "VISIBLE"), ok, why)
+    return ok
+}
+
+; Shutdown deliberately abandons the registration instead of sending NIM_DELETE.
+; The owner HWND/process is about to disappear anyway. Avoiding an explicit delete
+; removes MiniTray's last direct route into Explorer's crashing DeleteIcon path.
+MTIcon_Abandon(why := "") {
+    st := MTIcon_State()
+    MTIcon_Log("ABANDON", 1, why " (no Shell_NotifyIcon call)")
+    st.added := false
+    return true
+}
+
+; Compatibility guard: if an older code path ever calls MTIcon_Destroy, suppress
+; NIM_DELETE rather than reintroducing the crash trigger.
+MTIcon_Destroy(why := "") {
+    DebugLog("MTIcon_Destroy requested; NIM_DELETE intentionally suppressed", "INFO")
+    return MTIcon_Abandon(why ? why : "legacy destroy request")
+}
+
+; The restarted shell has no record of our icon, so re-register and restore the
+; state we believe it should be in.
+MTIcon_OnTaskbarCreated(wParam, lParam, msg, hwnd) {
+    st := MTIcon_State()
+    MTIcon_Log("TASKBAR_CREATED", 1, "re-register after Explorer/taskbar restart")
+
+    wasHidden := st.hidden
+    st.added  := false
+    if MTIcon_Add()
+        if wasHidden
+            MTIcon_SetHidden(true, "restore state after shell restart")
     return 0
 }
