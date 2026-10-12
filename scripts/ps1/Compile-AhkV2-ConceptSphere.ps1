@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Script,
     [string]$Ahk2Exe,
     [string]$Base,
-    [string]$Destination = 'C:\Program Files\ConceptSphere',
+    [string]$Destination = 'C:\Program Files\ConceptSphere Tools',
     [switch]$Quiet
 )
 

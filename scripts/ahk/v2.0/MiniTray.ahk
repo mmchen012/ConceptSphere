@@ -3,7 +3,7 @@
 #NoTrayIcon                     ; icon appears only while windows are hidden
 
 ; =============================================================================
-;  MiniTray.ahk  -  v2.37 (quiet empty-menu/save/final-restore tray reflow)
+;  MiniTray.ahk  -  v2.56 (shortcut learning compile fix)
 ;
 ;  Merged window manager: rule-driven auto-sizing (was WindowSizer v1.1) plus
 ;  hide-to-tray (was MiniTrayUtil). One process, one WinEvent dispatcher, one
@@ -14,9 +14,12 @@
 ;    Ctrl+Alt+4        create/edit a rule for the active window
 ;    Ctrl+Alt+Z        apply the matching rule to the active window
 ;    Ctrl+Alt+M        open the tray menu at the cursor
-;    Shift+Esc         hide the active window to the tray
-;    Ctrl+Shift+L      restore every hidden window
-;    Shift+Alt+Esc     hide all open windows in Alt+Tab order
+;    Shift+Esc         hide the active window to the tray (configurable)
+;    Ctrl+L            restore the topmost hidden window (configurable)
+;    Ctrl+Shift+L      restore every hidden window (configurable)
+;    Shift+Alt+Esc     hide all open windows in Alt+Tab order (configurable)
+;    Options > Keyboard shortcuts: choose Learn, press the new chord,
+;    then Save options. Escape cancels learning; Clear disables a shortcut.
 ;    Ctrl+Alt+H        announce what is currently hidden
 ;    Ctrl+Alt+Shift+Q  quit
 ;
@@ -29,6 +32,9 @@
 ;                       Speak=0|1, ConfirmCloseAll=0|1, AutoApply=0|1,
 ;                       QuietPlugin=0|1 (default 1; needs the minitrayQuiet
 ;                         NVDA add-on -- set 0 where it is not installed)
+;                       HotkeyHide=+Esc, HotkeyRestore=^l,
+;                       HotkeyHideAll=!+Esc, HotkeyRestoreAll=^+l
+;                         (blank disables; Ctrl+Alt+J notation also accepted)
 ;                       ExplorerSafeHide is retained for INI compatibility.
 ;                         Explorer folder windows are now hidden only when
 ;                         hosted outside the desktop-shell Explorer process.
@@ -41,10 +47,14 @@
 ;                       Enabled=0|1                   (default 1)
 ; =============================================================================
 
+; Alt/Win shortcut release must not inject Ctrl and cancel NVDA speech.
+A_MenuMaskKey := "vkE8"
+
 DetectHiddenWindows true
 SetTitleMatchMode 2
 
-; --- change APP_NAME to rename the tool; it is also the tray tooltip, and the
+; --- change APP_NAME to rename the tool; it prefixes the multi-window tray
+;     tooltip/accessibility name and the
 ;     tooltip is the only text a screen reader announces on the icon. ---------
 global APP_NAME  := "MiniTray"
 global INI_DIR   := A_AppData "\" APP_NAME          ; per-user, always writable
@@ -58,6 +68,11 @@ global OLD_CFG   := "__WindowSizer__"   ; pre-rename config section, migrated on
 global HID_SEC   := "__Hidden__"
 global MAX_LABEL := 60
 global NATIVE_RESTORE_HANDOFF_SETTLE := 25 ; let NVDA consume MTQUIET:0 / MTNATIVERESTORE
+global RESTORE_HUNG_PROBE_TIMEOUT := 120 ; bound WM_NULL responsiveness probes
+global RESTORE_REVEAL_TIMEOUT := 400    ; maximum wait for an async show request
+global RESTORE_REVEAL_POLL := 10        ; visibility polling interval
+global RESTORE_PENDING_RETRY_INTERVAL := 1000 ; poll an explicitly requested restore
+global RESTORE_PENDING_REQUEUE_INTERVAL := 2000 ; avoid flooding the owner queue
 global NVDA_MODE_GUARD_SETTLE := 8     ; let NVDA disable automatic browse/focus-mode switching before a hide moves focus
 global NVDA_MODE_GUARD_TIMEOUT := 1800 ; failsafe; explicit release normally happens much sooner
 global SPEECH_SETTLE := 350       ; ms to let focus changes and notification-area
@@ -117,7 +132,12 @@ global RESTORE_FOCUS_TIMEOUT := 8000
 global g_Rules    := []         ; parsed rule cache
 global g_Stamp    := ""         ; INI mtime|size, to know when to reparse
 global g_Cfg      := Map()      ; parsed [__MiniTray__]
+global g_WindowShortcuts := Map() ; active, normalized action -> shortcut
+global g_ShortcutLearning := 0     ; one owned, bounded keyboard capture
 global g_Hidden   := []         ; [{hwnd, pid, proc, title, how}] oldest first
+global g_PendingRestores := Map() ; hwnd -> explicit restore request awaiting owner recovery
+global g_PendingRestoreTimerActive := false
+global g_PendingRestorePollActive := false
 global g_NvdaModeGuardSerial := 1
 global g_PopupGui  := 0           ; the tray popup, replacing AHK's tray menu
 global g_PopupLabel := 0          ; accessible label for the current list level
@@ -180,15 +200,6 @@ MigrateOldSection()
 LoadConfig()
 LoadRules()
 
-; Compiled, Ahk2Exe embeds MiniTray.ico as the exe's main icon and the tray
-; picks it up automatically - so never fall back to shell32 in that case, or we
-; would replace a good embedded icon with a generic one.
-if FileExist(ICON_FILE)
-    TraySetIcon(ICON_FILE)
-else if (!A_IsCompiled)
-    TraySetIcon("shell32.dll", 44)
-A_IconTip := APP_NAME           ; CONSTANT - never append counts or titles
-
 ; MiniTray owns its notification-area icon directly (see MTIcon_* at the end
 ; of this file). Normal hide/show uses NIM_MODIFY + NIS_HIDDEN, and shutdown
 ; deliberately does NOT send NIM_DELETE. The Explorer crash path reached
@@ -209,6 +220,7 @@ OnMessage(0x404, TrayIconMsg)     ; AHK_NOTIFYICON: the shell's tray-icon click
 OnMessage(WM_MT_HIDE_ICON, CompleteDeferredTrayIconHide)
 OnMessage(0x0202, PopupListMouseUp) ; make ListBox rows activate like menu items
 OnMessage(WM_MT_RESTORE_FOCUS, RestoreFocusAfterSpeechMessage)
+OnMessage(0x0006, WindowShortcutLearningActivation) ; WM_ACTIVATE
 
 AdoptOrphans()                  ; recover windows stranded by a previous crash
 RefreshTray()
@@ -218,6 +230,7 @@ DebugLog("Startup complete: hidden=" g_Hidden.Length " rules=" g_Rules.Length
     " shellPid=" g_ShellPid " ini=" INI_FILE, "INFO")
 SetTimer(Prune, 5000)
 OnExit(HandleExit)
+InitializeWindowShortcuts()
 
 if (A_Args.Length >= 1 && IsShowArg(A_Args[1]))
     ShowMainGui()
@@ -225,11 +238,13 @@ if (A_Args.Length >= 1 && IsShowArg(A_Args[1]))
 ; =============================================================================
 ;  HOTKEYS
 ; =============================================================================
+#HotIf !IsObject(g_ShortcutLearning)
 ^!5::ShowMainGui()
 ^!4::RuleFlowForActiveWindow()
 ^!z::ApplyRuleToActiveWindow()
 ^!m::BeginTrayPopupOpen()       ; reachable even when the icon is auto-hidden
 ^!h::AnnounceHidden()
+#HotIf
 
 #HotIf (IsObject(g_PopupGui) && WinActive("ahk_id " g_PopupGui.Hwnd))
 Up::PopupMove(-1)
@@ -264,11 +279,432 @@ Delete::PopupCloseSelected()
 ~!Tab::PopupAltTabClose()
 ~+!Tab::PopupAltTabClose()
 #HotIf
-+Esc::HideActiveToTray()
-^l::RestoreLast()
-^+l::RestoreAll()
-!+Esc::HideAllOpenWindows()
+; Hide/restore bindings are registered by InitializeWindowShortcuts.
+#HotIf !IsObject(g_ShortcutLearning)
 ^!+q::QuitMiniTray()
+#HotIf
+
+; =============================================================================
+;  CONFIGURABLE WINDOW SHORTCUTS
+; =============================================================================
+WindowShortcutSpecs() {
+    static specs := [
+        {key: "HotkeyHide", shortLabel: "hide", label: "Hide active window", control: "OptHotkeyHide", defaultValue: "+Esc"},
+        {key: "HotkeyRestore", shortLabel: "restore", label: "Restore topmost hidden window", control: "OptHotkeyRestore", defaultValue: "^l"},
+        {key: "HotkeyHideAll", shortLabel: "hide all", label: "Hide all open windows", control: "OptHotkeyHideAll", defaultValue: "!+Esc"},
+        {key: "HotkeyRestoreAll", shortLabel: "restore all", label: "Restore all hidden windows", control: "OptHotkeyRestoreAll", defaultValue: "^+l"}
+    ]
+    return specs
+}
+
+; Accept ordinary text (Ctrl+Alt+J) and simple AHK notation (^!j). Keep one
+; canonical spelling so aliases and modifier ordering cannot create duplicates.
+NormalizeWindowShortcut(value) {
+    value := Trim(value)
+    if (value = "" || value = "None" || value = "Disabled")
+        return ""
+    modifiers := ""
+    if RegExMatch(value, "^([!^+#]+)([^!^+#\s]+)$", &match) {
+        modifiers := match[1]
+        key := match[2]
+    } else {
+        parts := StrSplit(value, "+", " `t")
+        key := parts.Pop()
+        for part in parts {
+            switch StrLower(part) {
+                case "ctrl", "control": symbol := "^"
+                case "alt": symbol := "!"
+                case "shift": symbol := "+"
+                case "win", "windows": symbol := "#"
+                default:
+                    throw ValueError("Use Ctrl, Alt, Shift or Win followed by a key, for example Ctrl+Alt+J.")
+            }
+            modifiers .= symbol
+        }
+    }
+    normalized := ""
+    for symbol in StrSplit("^!+#") {
+        count := StrLen(modifiers) - StrLen(StrReplace(modifiers, symbol))
+        if (count > 1)
+            throw ValueError("Each modifier may be used only once.")
+        if count
+            normalized .= symbol
+    }
+    ; Exclude custom combinations, key-up handlers and mouse/controller input.
+    ; Named keys also keep synthetic restore replay a single, well-formed chord.
+    if !RegExMatch(key, "i)^(?:[a-z0-9_]+|[;,.=/\[\]\\'-])$")
+        throw ValueError("Enter one key name, such as L, Esc, F9, Home or NumpadAdd.")
+    key := GetKeyName(key)
+    vk := GetKeyVK(key)
+    if (key = "" || !vk || vk < 8
+            || RegExMatch(key, "i)^(?:(?:L|R)?(?:Control|Ctrl|Alt|Shift|Win)|Joy\d+)$"))
+        throw ValueError("Choose a keyboard key after the modifiers, for example Ctrl+Alt+J.")
+    if (StrLen(key) = 1)
+        key := StrLower(key)
+    return normalized key
+}
+
+WindowShortcutText(shortcut) {
+    if (shortcut = "")
+        return "Disabled"
+    RegExMatch(shortcut, "^([!^+#]*)(.+)$", &match)
+    text := ""
+    if InStr(match[1], "^")
+        text .= "Ctrl+"
+    if InStr(match[1], "!")
+        text .= "Alt+"
+    if InStr(match[1], "+")
+        text .= "Shift+"
+    if InStr(match[1], "#")
+        text .= "Win+"
+    return text (StrLen(match[2]) = 1 ? StrUpper(match[2]) : match[2])
+}
+
+ValidateWindowShortcuts(source) {
+    reserved := Map()
+    reserved.CaseSense := false
+    for shortcut, label in Map(
+        "Ctrl+Alt+5", "Show MiniTray", "Ctrl+Alt+4", "Add or edit a rule",
+        "Ctrl+Alt+Z", "Apply a rule", "Ctrl+Alt+M", "Open the tray menu",
+        "Ctrl+Alt+H", "Announce hidden windows", "Ctrl+Alt+Shift+Q", "Quit MiniTray",
+        "Up", "tray menu navigation", "Down", "tray menu navigation",
+        "Left", "tray menu navigation", "Right", "tray menu navigation",
+        "Enter", "tray menu activation", "NumpadEnter", "tray menu activation",
+        "Shift+Enter", "tray menu close", "Shift+NumpadEnter", "tray menu close",
+        "Delete", "tray menu close", "AppsKey", "tray context menu",
+        "Shift+F10", "tray context menu", "Alt+Tab", "Windows task switching",
+        "Alt+Shift+Tab", "Windows task switching", "Ctrl+Alt+Delete", "Windows security",
+        "Win+L", "Windows locking")
+        reserved[NormalizeWindowShortcut(shortcut)] := label
+    bindings := Map()
+    used := Map()
+    used.CaseSense := false
+    for spec in WindowShortcutSpecs() {
+        try shortcut := NormalizeWindowShortcut(source.Get(spec.key, spec.defaultValue))
+        catch Error as err
+            throw ValueError(spec.label ": " err.Message)
+        if (shortcut != "") {
+            if reserved.Has(shortcut)
+                throw ValueError(spec.label ": " WindowShortcutText(shortcut)
+                    " is already used for " reserved[shortcut] ".")
+            if used.Has(shortcut)
+                throw ValueError(spec.label ": " WindowShortcutText(shortcut)
+                    " is also assigned to " used[shortcut] ". Choose different shortcuts.")
+            used[shortcut] := spec.label
+        }
+        bindings[spec.key] := shortcut
+    }
+    return bindings
+}
+
+WindowShortcutsEnabled(*) {
+    global g_MainGui, g_MainTab, g_ShortcutLearning
+    if IsObject(g_ShortcutLearning)
+        return false
+    ; Editing the Options page must not trigger a saved hide/restore command.
+    ; Return false to let normal typing and editing gestures reach the controls.
+    return !(g_MainGui && g_MainTab && g_MainTab.Value = 3
+        && WinActive("ahk_id " g_MainGui.Hwnd))
+}
+
+RunWindowShortcut(action, *) {
+    global g_PopupGui
+    if !WindowShortcutsEnabled()
+        return
+    popupActive := g_PopupGui && WinActive("ahk_id " g_PopupGui.Hwnd)
+    switch action {
+        case "HotkeyHide": HideActiveToTray()
+        case "HotkeyHideAll": HideAllOpenWindows()
+        case "HotkeyRestore":
+            if popupActive
+                PopupRestoreTopmostHotkey()
+            else
+                RestoreLast()
+        case "HotkeyRestoreAll":
+            if popupActive
+                PopupThen(RestoreAll)
+            else
+                RestoreAll()
+    }
+}
+
+ApplyWindowShortcuts(bindings) {
+    global g_WindowShortcuts
+    previous := g_WindowShortcuts.Clone()
+    wasCritical := A_IsCritical
+    Critical("On")
+    HotIf(WindowShortcutsEnabled)
+    try {
+        ; Disable the complete old set first, so swapping two actions works.
+        for action, shortcut in previous
+            if (shortcut != "")
+                Hotkey(shortcut, "Off")
+        for action, shortcut in bindings
+            if (shortcut != "")
+                Hotkey(shortcut, RunWindowShortcut.Bind(action), "On I0 T1 B0")
+        g_WindowShortcuts := bindings.Clone()
+    } catch Error as err {
+        ; A failed registration must not strand the user with half a new set.
+        for action, shortcut in bindings
+            if (shortcut != "")
+                try Hotkey(shortcut, "Off")
+        for action, shortcut in previous {
+            if (shortcut = "")
+                continue
+            try Hotkey(shortcut, RunWindowShortcut.Bind(action), "On I0 T1 B0")
+            catch Error as restoreError
+                DebugException("Unable to reinstate window shortcut " shortcut, restoreError)
+        }
+        throw err
+    } finally {
+        HotIf()
+        Critical(wasCritical)
+    }
+}
+
+InitializeWindowShortcuts() {
+    global g_Cfg
+    try bindings := ValidateWindowShortcuts(g_Cfg)
+    catch Error as err {
+        DebugException("Invalid configured window shortcuts; using defaults", err)
+        bindings := ValidateWindowShortcuts(Map())
+        SetTimer(ShowWindowShortcutStartupError.Bind(err.Message), -1000)
+    }
+    ApplyWindowShortcuts(bindings)
+    for action, shortcut in bindings
+        g_Cfg[action] := shortcut
+}
+
+ShowWindowShortcutStartupError(message, *) {
+    global APP_NAME
+    MsgBox("The saved keyboard shortcuts could not be loaded.`n`n" message
+        "`n`nThe default shortcuts are active. Open Options to correct and save them."
+        , APP_NAME, "Icon!")
+}
+
+ResetWindowShortcutOptions(*) {
+    global g_MainGui
+    for spec in WindowShortcutSpecs()
+        g_MainGui[spec.control].Value := WindowShortcutText(NormalizeWindowShortcut(spec.defaultValue))
+    g_MainGui["OptHotkeyHide"].Focus()
+}
+
+; Learning suppresses the entire chord, including modifier down/up events.
+; Track modifiers from the ordered notifications, not a later GetKeyState
+; snapshot: a quickly released chord must retain its original modifiers.
+BeginWindowShortcutLearning(spec, *) {
+    global g_MainGui, g_MainTab, g_ShortcutLearning, APP_NAME
+    if (IsObject(g_ShortcutLearning) || !g_MainGui || g_MainTab.Value != 3)
+        return
+    state := {spec: spec, gui: 0, input: 0, phase: "arming", held: Map(),
+        modifiers: Map(), shortcut: "", outcome: "", error: "", startedAt: A_TickCount}
+    g_ShortcutLearning := state
+    try {
+        g := Gui("+Owner" g_MainGui.Hwnd " +ToolWindow", "Learn shortcut - " spec.label)
+        state.gui := g
+        g.SetFont("s10", "Segoe UI")
+        g.MarginX := 16, g.MarginY := 16
+        g.Add("Text", "xm ym w510", "New shortcut for " spec.label)
+        prompt := g.Add("Edit", "xm y+8 w510 r3 ReadOnly",
+            "Release the Learn key, then press your new shortcut.`r`n"
+            . "Use Ctrl, Alt, Shift or Win with a key. Escape alone cancels.`r`n"
+            . "Release the complete shortcut to finish learning.")
+        b := g.Add("Button", "xm y+12 w150", "Cancel learning")
+        b.OnEvent("Click", (*) => EndWindowShortcutLearning("cancelled"))
+        g.OnEvent("Close", (*) => EndWindowShortcutLearning("cancelled"))
+        g.OnEvent("Escape", (*) => EndWindowShortcutLearning("cancelled"))
+        g_MainGui.Opt("+Disabled")
+        g.Show()
+        prompt.Focus()
+        ; Start after the key that activated Learn is released. Its key-up must
+        ; reach Windows, as its key-down occurred before the learning hook.
+        SetTimer(PollWindowShortcutLearning, 25)
+    } catch Error as err {
+        EndWindowShortcutLearning("cancelled")
+        DebugException("Unable to start shortcut learning", err)
+        MsgBox("Unable to start shortcut learning.`n`n" err.Message
+            , APP_NAME, "Icon! Owner" g_MainGui.Hwnd)
+    }
+}
+
+WindowShortcutKeysDown() {
+    ; Ignore mouse buttons. Keyboard modifiers/locks use their physical state,
+    ; so an enabled CapsLock or NumLock cannot keep learning in the arming phase.
+    Loop 248
+        if GetKeyState(Format("vk{:02X}", A_Index + 7), "P")
+            return true
+    return false
+}
+
+PollWindowShortcutLearning(*) {
+    global g_ShortcutLearning
+    if !IsObject(g_ShortcutLearning)
+        return
+    state := g_ShortcutLearning
+    if (!IsObject(state.gui) || !WinActive("ahk_id " state.gui.Hwnd)) {
+        EndWindowShortcutLearning("cancelled", false)
+        return
+    }
+    if (A_TickCount - state.startedAt >= 30000) {
+        EndWindowShortcutLearning("timeout")
+        return
+    }
+    if (state.phase != "arming" || WindowShortcutKeysDown())
+        return
+    try {
+        ih := InputHook("L0 I101 T30")
+        ih.KeyOpt("{All}", "NS")
+        ih.OnKeyDown := WindowShortcutLearningKeyDown
+        ih.OnKeyUp := WindowShortcutLearningKeyUp
+        ih.OnEnd := WindowShortcutLearningInputEnded
+        state.input := ih
+        state.phase := "capturing"
+        ih.Start()
+    } catch Error as err {
+        state.error := err.Message
+        EndWindowShortcutLearning("error")
+    }
+}
+
+WindowShortcutLearningModifier(vk) {
+    switch vk {
+        case 0x10, 0xA0, 0xA1: return "+" ; Shift, left/right Shift
+        case 0x11, 0xA2, 0xA3: return "^" ; Ctrl, left/right Ctrl
+        case 0x12, 0xA4, 0xA5: return "!" ; Alt, left/right Alt
+        case 0x5B, 0x5C: return "#"        ; left/right Win
+    }
+    return ""
+}
+
+WindowShortcutLearningKeyDown(ih, vk, sc) {
+    global g_ShortcutLearning
+    Critical("On") ; serialize modifier/key notifications even for quick chords
+    if (!IsObject(g_ShortcutLearning) || g_ShortcutLearning.input != ih)
+        return
+    state := g_ShortcutLearning
+    if !WinActive("ahk_id " state.gui.Hwnd) {
+        EndWindowShortcutLearning("cancelled", false)
+        return
+    }
+    code := Format("vk{:02X}sc{:03X}", vk, sc)
+    physicalKey := sc ? Format("sc{:03X}", sc) : Format("vk{:02X}", vk)
+    state.held[physicalKey] := true
+    ; Ignore repeats and subsequent keys after the first complete chord. Keep
+    ; swallowing their releases so none can operate the underlying Options GUI.
+    if (state.phase != "capturing")
+        return
+    modifier := WindowShortcutLearningModifier(vk)
+    if (modifier != "") {
+        state.modifiers[vk] := modifier
+        return
+    }
+    modifiers := ""
+    for symbol in StrSplit("^!+#") {
+        for modifierVk, pressedSymbol in state.modifiers {
+            if (pressedSymbol = symbol) {
+                modifiers .= symbol
+                break
+            }
+        }
+    }
+    state.phase := "releasing"
+    if (vk = 0x1B && modifiers = "") {
+        state.outcome := "cancelled"
+        return
+    }
+    try {
+        state.shortcut := NormalizeWindowShortcut(modifiers code)
+        ; Reject reserved shortcuts now. Cross-row duplicate validation remains
+        ; on Save, allowing the user to swap the assignments of two actions.
+        requested := Map()
+        for spec in WindowShortcutSpecs()
+            requested[spec.key] := ""
+        requested[state.spec.key] := state.shortcut
+        ValidateWindowShortcuts(requested)
+        state.outcome := "captured"
+    } catch Error as err {
+        state.error := err.Message
+        state.outcome := "error"
+    }
+}
+
+WindowShortcutLearningKeyUp(ih, vk, sc) {
+    global g_ShortcutLearning
+    Critical("On")
+    if (!IsObject(g_ShortcutLearning) || g_ShortcutLearning.input != ih)
+        return
+    state := g_ShortcutLearning
+    ; Releasing Shift can change a numpad key's VK before its own key-up.
+    ; Match its physical scan code so capture still finishes in that order.
+    physicalKey := sc ? Format("sc{:03X}", sc) : Format("vk{:02X}", vk)
+    if state.held.Has(physicalKey)
+        state.held.Delete(physicalKey)
+    if state.modifiers.Has(vk)
+        state.modifiers.Delete(vk)
+    if (state.phase = "releasing" && !state.held.Count)
+        EndWindowShortcutLearning()
+}
+
+WindowShortcutLearningInputEnded(ih) {
+    global g_ShortcutLearning
+    if (IsObject(g_ShortcutLearning) && g_ShortcutLearning.input = ih)
+        EndWindowShortcutLearning(ih.EndReason = "Timeout" ? "timeout" : "cancelled")
+}
+
+WindowShortcutLearningActivation(wParam, lParam, msg, hwnd) {
+    global g_ShortcutLearning
+    ; Stop immediately if the user clicks another application. The timer is
+    ; also a fallback for destruction or a missed activation notification.
+    if (IsObject(g_ShortcutLearning) && IsObject(g_ShortcutLearning.gui)
+            && hwnd = g_ShortcutLearning.gui.Hwnd && (wParam & 0xFFFF) = 0)
+        EndWindowShortcutLearning("cancelled", false)
+}
+
+EndWindowShortcutLearning(outcome := "", restoreFocus := true) {
+    global g_ShortcutLearning, g_MainGui, APP_NAME
+    if !IsObject(g_ShortcutLearning)
+        return
+    state := g_ShortcutLearning
+    g_ShortcutLearning := 0  ; invalidate queued callbacks before stopping/destroying
+    SetTimer(PollWindowShortcutLearning, 0)
+    active := IsObject(state.gui) && WinActive("ahk_id " state.gui.Hwnd)
+    if (outcome = "")
+        outcome := active ? state.outcome : "cancelled"
+    if IsObject(state.input) {
+        state.input.OnEnd := ""
+        state.input.Stop()
+    }
+    try g_MainGui.Opt("-Disabled")
+    if IsObject(state.gui)
+        try state.gui.Destroy()
+    if (outcome = "captured")
+        g_MainGui[state.spec.control].Value := WindowShortcutText(state.shortcut)
+    ; Never pull focus back after the user has switched to another application.
+    if (!restoreFocus || !active)
+        return
+    try WinActivate("ahk_id " g_MainGui.Hwnd)
+    if (outcome = "error") {
+        DebugLog("Shortcut learning rejected: " state.error, "WARN")
+        MsgBox("That shortcut could not be learned.`n`n" state.error
+            , APP_NAME, "Icon! Owner" g_MainGui.Hwnd)
+    } else if (outcome = "timeout") {
+        MsgBox("Learning timed out. The previous shortcut is unchanged.`n"
+            . "Choose Learn to try again.", APP_NAME, "Icon! Owner" g_MainGui.Hwnd)
+    }
+    ; Native focus reads the labelled shortcut value through NVDA, including
+    ; when the optional 'Announce actions' setting is off. No synthetic keys.
+    if (outcome = "captured") {
+        try g_MainGui[state.spec.control].Focus()
+    } else {
+        try g_MainGui[state.spec.control "Learn"].Focus()
+    }
+}
+
+ClearWindowShortcutOption(spec, *) {
+    global g_MainGui
+    g_MainGui[spec.control].Value := "Disabled"
+    g_MainGui[spec.control].Focus()
+}
 
 IsShowArg(a) {
     a := StrLower(Trim(a))
@@ -535,6 +971,9 @@ LoadConfig() {
                   , "ExplorerSafeHide","1")
         if !g_Cfg.Has(k)
             g_Cfg[k] := v
+    for spec in WindowShortcutSpecs()
+        if !g_Cfg.Has(spec.key)
+            g_Cfg[spec.key] := spec.defaultValue
     DebugLog("Config loaded: Speak=" g_Cfg.Get("Speak", "0")
         " QuietPlugin=" g_Cfg.Get("QuietPlugin", "1")
         " AutoApply=" g_Cfg.Get("AutoApply", "1")
@@ -629,6 +1068,9 @@ EnsureIni() {
     txt .= "; Explorer windows require Folder Options > Launch folder windows" nl
     txt .= "; in a separate process. Shell-owned Explorer windows are refused." nl
     txt .= "ExplorerSafeHide=1" nl
+    txt .= "; Keyboard shortcuts: simple AHK notation or Ctrl+Alt+J; blank disables." nl
+    for spec in WindowShortcutSpecs()
+        txt .= spec.key "=" spec.defaultValue nl
     FileAppend(txt, INI_FILE, "UTF-8")
 }
 
@@ -866,7 +1308,18 @@ HandleEvent(ev, hwnd) {
     ; WinEvents may re-enter while an earlier event is still being handled.
     ; Never auto-apply or queue another hide against a window in the middle of
     ; a hide/restore transaction, or against one already owned by MiniTray.
-    if (g_Restoring || IsOwnWindow(hwnd) || IsTransitioning(hwnd) || FindHidden(hwnd))
+    ; A hidden application's top-level HWND can continue changing its caption
+    ; (browser tab changes, document saves, media progress, and so on).  The
+    ; old early return below discarded those NAMECHANGE events, leaving the
+    ; title captured at hide time in every MiniTray view.  Consume that event
+    ; here before hidden windows are excluded from rule/hide processing.
+    hiddenIndex := FindHidden(hwnd)
+    if (ev = EV_NAMECHANGE && hiddenIndex) {
+        UpdateHiddenWindowTitle(hwnd, hiddenIndex)
+        return
+    }
+
+    if (g_Restoring || IsOwnWindow(hwnd) || IsTransitioning(hwnd) || hiddenIndex)
         return
 
     if (ev = EV_FOREGROUND) {
@@ -904,6 +1357,50 @@ HandleEvent(ev, hwnd) {
     } else if (ev = EV_MINIMIZESTART) {
         MaybeHideOnMinimize(hwnd)
     }
+}
+
+UpdateHiddenWindowTitle(hwnd, hiddenIndex := 0) {
+    global g_Hidden, g_MainGui, g_PopupGui, g_PopupLB
+
+    if (!hiddenIndex)
+        hiddenIndex := FindHidden(hwnd)
+    if (!hiddenIndex || hiddenIndex > g_Hidden.Length)
+        return false
+
+    try title := Trim(WinGetTitle("ahk_id " hwnd))
+    catch
+        return false
+    if (title = "")
+        title := "(untitled)"
+    if (g_Hidden[hiddenIndex].title = title)
+        return false
+
+    oldTitle := g_Hidden[hiddenIndex].title
+    g_Hidden[hiddenIndex].title := title
+    SaveHidden()
+    RefreshTray()
+
+    ; Refresh either visible representation immediately.  Preserve the popup's
+    ; logical selection so a changing title never moves the keyboard user to a
+    ; different command or hidden window.
+    if (IsObject(g_MainGui)
+            && DllCall("User32\IsWindowVisible", "Ptr", g_MainGui.Hwnd))
+        RefreshHidden()
+
+    if (IsObject(g_PopupGui)
+            && DllCall("User32\IsWindowVisible", "Ptr", g_PopupGui.Hwnd)) {
+        selectedIndex := g_PopupLB ? g_PopupLB.Value : 0
+        selectedProc := "", selectedHwnd := 0
+        if (selected := PopupSelectedItem()) {
+            selectedProc := selected.proc
+            selectedHwnd := selected.hwnd
+        }
+        FillTrayPopup(selectedIndex, selectedProc, selectedHwnd)
+    }
+
+    DebugLog("Hidden window title updated: hwnd=" hwnd
+        " old=" oldTitle " new=" title, "DEBUG")
+    return true
 }
 
 QueueForegroundRuleApply(hwnd) {
@@ -2124,53 +2621,102 @@ FocusedWindowAnnouncement(hwnd) {
 }
 
 WindowMatchesRecord(e) {
-    if !WinExist("ahk_id " e.hwnd)
+    if (!e || !e.HasOwnProp("hwnd") || !e.HasOwnProp("pid")
+            || !DllCall("User32\IsWindow", "Ptr", e.hwnd))
         return false
-    try {
-        return WinGetPID("ahk_id " e.hwnd) = e.pid
-    } catch {
+    actualPid := 0
+    DllCall("User32\GetWindowThreadProcessId"
+        , "Ptr", e.hwnd, "UInt*", &actualPid, "UInt")
+    return actualPid = e.pid
+}
+
+; Probe the owning top-level window with a hard timeout. IsHungAppWindow catches
+; Windows' established ghost-window state immediately; WM_NULL also detects a
+; blocked UI thread before a ghost has been created. SendMessageTimeout bounds
+; the only cross-process message in the probe, so MiniTray itself stays usable.
+WindowIsHung(hwnd) {
+    global RESTORE_HUNG_PROBE_TIMEOUT
+    if (!hwnd || !DllCall("User32\IsWindow", "Ptr", hwnd))
         return false
+
+    root := DllCall("User32\GetAncestor", "Ptr", hwnd, "UInt", 2, "Ptr") ; GA_ROOT
+    if !root
+        root := hwnd
+    if DllCall("User32\IsHungAppWindow", "Ptr", root)
+        return true
+
+    result := 0
+    sent := DllCall("User32\SendMessageTimeoutW"
+        , "Ptr", root, "UInt", 0, "Ptr", 0, "Ptr", 0       ; WM_NULL
+        , "UInt", 0x3                                      ; BLOCK|ABORTIFHUNG
+        , "UInt", RESTORE_HUNG_PROBE_TIMEOUT
+        , "Ptr*", &result, "Ptr")
+    return !sent
+}
+
+WaitForEntryVisible(e, timeoutMs := 0) {
+    global RESTORE_REVEAL_TIMEOUT, RESTORE_REVEAL_POLL
+    if (timeoutMs <= 0)
+        timeoutMs := RESTORE_REVEAL_TIMEOUT
+    deadline := A_TickCount + timeoutMs
+    loop {
+        if !WindowMatchesRecord(e)
+            return false
+        if DllCall("User32\IsWindowVisible", "Ptr", e.hwnd)
+            return true
+        if (A_TickCount >= deadline)
+            return false
+        Sleep RESTORE_REVEAL_POLL
     }
 }
 
-Reveal(e, activate := false, focusNow := true) {
-    if !WindowMatchesRecord(e)
-        return
-    if (e.how = "min") {
-        TaskbarTab(e.hwnd, true)
-        try WinRestore("ahk_id " e.hwnd)
-    } else {
-        try WinShow("ahk_id " e.hwnd)
-    }
-    if (activate) {
-        try WinActivate("ahk_id " e.hwnd)
-        if focusNow
-            ReturnFocus(e)
-    }
-}
-
-; Fast restore-all reveal. AutoHotkey's WinShow/WinRestore commands apply a
-; built-in post-command delay, which becomes noticeable across many windows.
-; SetWindowPos rebuilds the saved Z-order without activating each intermediate
-; application, and SW_SHOWNOACTIVATE restores minimize-backed entries without
-; generating a foreground transition.
-RevealBatchFast(e) {
+; Queue visibility and Z-order work on the owner thread. SWP_ASYNCWINDOWPOS is
+; essential here: ordinary SetWindowPos can synchronously wait forever when a
+; hidden application's UI thread has stopped pumping messages.
+RequestEntryRevealAsync(e) {
     if !WindowMatchesRecord(e)
         return false
 
-    if (e.how = "min") {
+    if (e.how = "min")
         TaskbarTab(e.hwnd, true)
-        ; SW_SHOWNOACTIVATE = 4: restore the window without taking focus.
-        DllCall("User32\ShowWindow", "Ptr", e.hwnd, "Int", 4)
-    }
 
-    ; HWND_TOP plus SWP_SHOWWINDOW rebuilds the chain bottom-to-top while
-    ; SWP_NOACTIVATE prevents Edge/browse-mode churn during the batch.
-    static flags := 0x0001 | 0x0002 | 0x0010 | 0x0040
+    DllCall("User32\ShowWindowAsync", "Ptr", e.hwnd, "Int", 4) ; SW_SHOWNOACTIVATE
+    static flags := 0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x4000
+        ; NOSIZE | NOMOVE | NOACTIVATE | SHOWWINDOW | ASYNCWINDOWPOS
     return !!DllCall("User32\SetWindowPos"
         , "Ptr", e.hwnd, "Ptr", 0
         , "Int", 0, "Int", 0, "Int", 0, "Int", 0
         , "UInt", flags)
+}
+
+Reveal(e, activate := false, focusNow := true) {
+    if !RevealBatchFast(e)
+        return false
+    if (activate) {
+        activated := ForceForegroundWindow(e.hwnd)
+        if (activated && focusNow && !WindowIsHung(e.hwnd))
+            ReturnFocus(e)
+    }
+    return true
+}
+
+; Queue a no-activation reveal, then wait only for a bounded visibility result.
+; A hung owner remains tracked in g_Hidden so the user can retry or close it;
+; most importantly, it can no longer wedge MiniTray's tray and hotkey thread.
+RevealBatchFast(e, timeoutMs := 0) {
+    global RESTORE_REVEAL_TIMEOUT
+    if !WindowMatchesRecord(e)
+        return false
+
+    wasHung := WindowIsHung(e.hwnd)
+    queued := RequestEntryRevealAsync(e)
+    visible := queued && WaitForEntryVisible(e, timeoutMs)
+    if !visible {
+        DebugLog("Async reveal did not complete: hwnd=" e.hwnd
+            " queued=" queued " hung=" (wasHung || WindowIsHung(e.hwnd))
+            " timeoutMs=" (timeoutMs > 0 ? timeoutMs : RESTORE_REVEAL_TIMEOUT), "WARN")
+    }
+    return visible
 }
 
 ; Activate the final restored window without AutoHotkey's per-command sleeps.
@@ -2181,11 +2727,20 @@ ActivateEntryBatchFast(e) {
         return false
 
     hwnd := e.hwnd
-    DllCall("User32\BringWindowToTop", "Ptr", hwnd)
+    if WindowIsHung(hwnd) {
+        DebugLog("Skipping restore activation for unresponsive target: hwnd=" hwnd, "WARN")
+        return false
+    }
+
+    ; Keep the Z-order request asynchronous for the same reason as reveal.
+    RequestEntryRevealAsync(e)
     DllCall("User32\SetForegroundWindow", "Ptr", hwnd)
-    DllCall("User32\SetActiveWindow", "Ptr", hwnd)
 
     if (DllCall("User32\GetForegroundWindow", "Ptr") != hwnd) {
+        if WindowIsHung(hwnd) {
+            DebugLog("Restore target became unresponsive before focus handoff: hwnd=" hwnd, "WARN")
+            return false
+        }
         currentThread := DllCall("Kernel32\GetCurrentThreadId", "UInt")
         targetThread := DllCall("User32\GetWindowThreadProcessId"
             , "Ptr", hwnd, "Ptr", 0, "UInt")
@@ -2201,9 +2756,7 @@ ActivateEntryBatchFast(e) {
                     && foregroundThread != targetThread)
                 attachedForeground := !!DllCall("User32\AttachThreadInput"
                     , "UInt", currentThread, "UInt", foregroundThread, "Int", true)
-            DllCall("User32\BringWindowToTop", "Ptr", hwnd)
             DllCall("User32\SetForegroundWindow", "Ptr", hwnd)
-            DllCall("User32\SetActiveWindow", "Ptr", hwnd)
         } finally {
             if attachedForeground
                 DllCall("User32\AttachThreadInput"
@@ -2230,6 +2783,10 @@ ActivateEntryBatchFast(e) {
 FocusControlBatchFast(ctrl) {
     if (!ctrl || !DllCall("User32\IsWindow", "Ptr", ctrl))
         return false
+    if WindowIsHung(ctrl) {
+        DebugLog("Skipping restore focus for unresponsive target control: hwnd=" ctrl, "WARN")
+        return false
+    }
 
     currentThread := DllCall("Kernel32\GetCurrentThreadId", "UInt")
     targetThread := DllCall("User32\GetWindowThreadProcessId"
@@ -2266,6 +2823,8 @@ TryFocus(winHwnd, ctrl, *) {
     if (!ctrl || !DllCall("User32\IsWindow", "Ptr", ctrl))
         return                           ; the control went away with a re-layout
     if !WinExist("ahk_id " winHwnd)
+        return
+    if WindowIsHung(winHwnd)
         return
     try ControlFocus(ctrl)
 }
@@ -2393,6 +2952,11 @@ CompleteDeferredFocus(token) {
         EndQuiet()
         return
     }
+    if WindowIsHung(rec.hwnd) {
+        DebugLog("Skipping deferred focus restore for unresponsive target: hwnd=" rec.hwnd, "WARN")
+        EndQuiet()
+        return
+    }
 
     if (rec.HasOwnProp("savedFocusOnly") && rec.savedFocusOnly) {
         ; The restore summary has now genuinely finished. Keep one short quiet
@@ -2494,12 +3058,16 @@ ActivateAndRestoreNativeFocus(rec, *) {
         try g_FocusBridgeGui.Hide()
         return
     }
+    if WindowIsHung(rec.hwnd) {
+        DebugLog("Skipping native focus restore for unresponsive target: hwnd=" rec.hwnd, "WARN")
+        try g_FocusBridgeGui.Hide()
+        return
+    }
 
-    try WinActivate("ahk_id " rec.hwnd)
-    try WinWaitActive("ahk_id " rec.hwnd, , 0.8)
+    activated := ForceForegroundWindow(rec.hwnd, 0.8)
     try g_FocusBridgeGui.Hide()
 
-    if (DllCall("User32\GetForegroundWindow", "Ptr") != rec.hwnd)
+    if (!activated || DllCall("User32\GetForegroundWindow", "Ptr") != rec.hwnd)
         return
 
     ; Most applications restore their own last child automatically. Verify
@@ -2512,6 +3080,7 @@ ActivateAndRestoreNativeFocus(rec, *) {
 VerifyRestoredNativeFocus(rec, *) {
     global RESTORE_FOCUS_LINE_DELAY
     if (!WindowMatchesFocusRecord(rec)
+            || WindowIsHung(rec.hwnd)
             || DllCall("User32\GetForegroundWindow", "Ptr") != rec.hwnd)
         return
 
@@ -2545,15 +3114,15 @@ RequestNvdaFocusedLine(rec, *) {
 }
 
 WindowMatchesFocusRecord(rec) {
-    if (!rec || !rec.HasOwnProp("hwnd") || !WinExist("ahk_id " rec.hwnd))
+    if (!rec || !rec.HasOwnProp("hwnd")
+            || !DllCall("User32\IsWindow", "Ptr", rec.hwnd))
         return false
     if (rec.HasOwnProp("pid")) {
-        try {
-            if (WinGetPID("ahk_id " rec.hwnd) != rec.pid)
-                return false
-        } catch {
+        actualPid := 0
+        DllCall("User32\GetWindowThreadProcessId"
+            , "Ptr", rec.hwnd, "UInt*", &actualPid, "UInt")
+        if (actualPid != rec.pid)
             return false
-        }
     }
     return true
 }
@@ -2568,7 +3137,7 @@ ResolveFocusControl(rec) {
 }
 
 FocusRecordNow(rec, *) {
-    if !WindowMatchesFocusRecord(rec)
+    if (!WindowMatchesFocusRecord(rec) || WindowIsHung(rec.hwnd))
         return
 
     ctrl := ResolveFocusControl(rec)
@@ -2602,18 +3171,36 @@ ActivateEntryNow(e) {
 
 ; WinActivate from inside a tray/ListBox callback can be undone when Windows
 ; returns from that callback. PopupThen already moves us to the next message
-; turn; this helper then verifies foreground ownership and uses attached input
-; queues as a bounded fallback rather than accepting an arbitrary destination.
+; turn. Keep every show/Z-order request asynchronous and use attached input
+; queues only for the non-blocking foreground request.
 ForceForegroundWindow(hwnd, waitSeconds := 0.25) {
-    if (!hwnd || !WinExist("ahk_id " hwnd))
+    if (!hwnd || !DllCall("User32\IsWindow", "Ptr", hwnd))
         return false
+    if WindowIsHung(hwnd) {
+        DebugLog("Skipping foreground request for unresponsive target: hwnd=" hwnd, "WARN")
+        return false
+    }
 
-    try WinShow("ahk_id " hwnd)
-    try WinRestore("ahk_id " hwnd)
-    try WinActivate("ahk_id " hwnd)
-    try WinWaitActive("ahk_id " hwnd, , waitSeconds)
-    if (DllCall("User32\GetForegroundWindow", "Ptr") = hwnd)
-        return true
+    showCommand := DllCall("User32\IsIconic", "Ptr", hwnd) ? 9 : 5
+    DllCall("User32\ShowWindowAsync", "Ptr", hwnd, "Int", showCommand)
+    static asyncTopFlags := 0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x4000
+    DllCall("User32\SetWindowPos"
+        , "Ptr", hwnd, "Ptr", 0
+        , "Int", 0, "Int", 0, "Int", 0, "Int", 0
+        , "UInt", asyncTopFlags)
+    DllCall("User32\SetForegroundWindow", "Ptr", hwnd)
+
+    deadline := A_TickCount + Max(1, Round(waitSeconds * 1000))
+    loop {
+        if (DllCall("User32\GetForegroundWindow", "Ptr") = hwnd)
+            return true
+        if (A_TickCount >= deadline)
+            break
+        Sleep 5
+    }
+
+    if WindowIsHung(hwnd)
+        return false
 
     currentThread := DllCall("Kernel32\GetCurrentThreadId", "UInt")
     targetThread := DllCall("User32\GetWindowThreadProcessId", "Ptr", hwnd, "Ptr", 0, "UInt")
@@ -2631,9 +3218,7 @@ ForceForegroundWindow(hwnd, waitSeconds := 0.25) {
             attachedForeground := !!DllCall("User32\AttachThreadInput"
                 , "UInt", currentThread, "UInt", foregroundThread, "Int", true)
 
-        DllCall("User32\BringWindowToTop", "Ptr", hwnd)
         DllCall("User32\SetForegroundWindow", "Ptr", hwnd)
-        DllCall("User32\SetActiveWindow", "Ptr", hwnd)
     } finally {
         if attachedForeground
             DllCall("User32\AttachThreadInput"
@@ -2643,13 +3228,21 @@ ForceForegroundWindow(hwnd, waitSeconds := 0.25) {
                 , "UInt", currentThread, "UInt", targetThread, "Int", false)
     }
 
-    try WinWaitActive("ahk_id " hwnd, , 0.5)
-    return DllCall("User32\GetForegroundWindow", "Ptr") = hwnd
+    deadline := A_TickCount + 500
+    loop {
+        if (DllCall("User32\GetForegroundWindow", "Ptr") = hwnd)
+            return true
+        if (A_TickCount >= deadline || WindowIsHung(hwnd))
+            return false
+        Sleep 5
+    }
 }
 
 ForceControlFocus(winHwnd, ctrl) {
     if (!ctrl || !DllCall("User32\IsWindow", "Ptr", ctrl)
             || !WinExist("ahk_id " winHwnd))
+        return false
+    if WindowIsHung(winHwnd)
         return false
 
     try ControlFocus(ctrl)
@@ -2679,17 +3272,105 @@ ForceControlFocus(winHwnd, ctrl) {
 
 Dismiss(e) {
     if !WindowMatchesRecord(e)
-        return
-    if (e.how = "min")
-        TaskbarTab(e.hwnd, true)
-    try WinShow("ahk_id " e.hwnd)                    ; unhide first, so a
-    try WinClose("ahk_id " e.hwnd)                   ; save prompt is visible
+        return false
+
+    ; Both operations are posted. WinShow/WinClose can synchronously wait on a
+    ; hung owner and previously made Close another way to wedge MiniTray.
+    RequestEntryRevealAsync(e)                       ; expose any save prompt
+    posted := !!DllCall("User32\PostMessageW"
+        , "Ptr", e.hwnd, "UInt", 0x0010, "Ptr", 0, "Ptr", 0) ; WM_CLOSE
+    if !posted
+        DebugLog("Unable to queue close for hidden window: hwnd=" e.hwnd, "WARN")
+    return posted
 }
 
 Forget(hwnd) {
-    global g_Hidden
+    global g_Hidden, g_PendingRestores
     if (i := FindHidden(hwnd))
         g_Hidden.RemoveAt(i)
+    if g_PendingRestores.Has(hwnd)
+        g_PendingRestores.Delete(hwnd)
+}
+
+QueuePendingRestore(e, announceWindow := false) {
+    global g_PendingRestores, g_PendingRestoreTimerActive
+    global RESTORE_PENDING_RETRY_INTERVAL
+    if !WindowMatchesRecord(e)
+        return 0
+    if g_PendingRestores.Has(e.hwnd)
+        return 2
+
+    g_PendingRestores[e.hwnd] := {
+        pid: e.pid,
+        announceWindow: !!announceWindow,
+        requestedAt: A_TickCount,
+        revealQueuedAt: 0
+    }
+    if !g_PendingRestoreTimerActive {
+        g_PendingRestoreTimerActive := true
+        SetTimer(ProcessPendingRestores, RESTORE_PENDING_RETRY_INTERVAL)
+    }
+    DebugLog("Restore queued until target responds: hwnd=" e.hwnd
+        " pid=" e.pid " title=" e.title, "WARN")
+    return 1
+}
+
+ProcessPendingRestores(*) {
+    global g_Hidden, g_PendingRestores
+    global g_PendingRestoreTimerActive, g_PendingRestorePollActive
+    global RESTORE_PENDING_REQUEUE_INTERVAL
+
+    if g_PendingRestorePollActive
+        return
+    if !g_PendingRestores.Count {
+        SetTimer(ProcessPendingRestores, 0)
+        g_PendingRestoreTimerActive := false
+        return
+    }
+
+    g_PendingRestorePollActive := true
+    changed := false
+    try {
+        for hwnd, pending in g_PendingRestores.Clone() {
+            i := FindHidden(hwnd)
+            if (!i || !WindowMatchesRecord(g_Hidden[i])) {
+                Forget(hwnd)
+                changed := true
+                continue
+            }
+
+            e := g_Hidden[i]
+            if DllCall("User32\IsWindowVisible", "Ptr", hwnd) {
+                DebugLog("Pending restore target became visible; completing handoff: hwnd=" hwnd
+                    " waitedMs=" (A_TickCount - pending.requestedAt), "INFO")
+                RestoreOne(hwnd, pending.announceWindow, true)
+                return
+            }
+
+            if WindowIsHung(hwnd)
+                continue
+
+            if (!pending.revealQueuedAt
+                    || A_TickCount - pending.revealQueuedAt >= RESTORE_PENDING_REQUEUE_INTERVAL) {
+                queued := RequestEntryRevealAsync(e)
+                pending.revealQueuedAt := A_TickCount
+                DebugLog("Pending restore reveal queued: hwnd=" hwnd
+                    " queued=" queued
+                    " waitedMs=" (A_TickCount - pending.requestedAt), "DEBUG")
+            }
+        }
+    } finally {
+        g_PendingRestorePollActive := false
+    }
+
+    if changed {
+        SaveHidden()
+        RefreshTray()
+    }
+    if !g_PendingRestores.Count {
+        SetTimer(ProcessPendingRestores, 0)
+        g_PendingRestoreTimerActive := false
+    }
 }
 
 RememberNvdaFocus(hwnd, pid) {
@@ -2713,7 +3394,7 @@ RequestNvdaSavedFocusRestore(e) {
     Announce(Chr(1) "MTRESTORESAVEDFOCUS:" e.hwnd ":" e.pid Chr(1), false)
 }
 
-RestoreOne(hwnd, announceWindow := false, *) {
+RestoreOne(hwnd, announceWindow := false, pendingRetry := false, *) {
     global g_Hidden, SPEECH_SETTLE, g_FocusBridgeGui, NATIVE_RESTORE_HANDOFF_SETTLE
     startedAt := A_TickCount
     DebugLog("RestoreOne requested: hwnd=" hwnd " hiddenCount=" g_Hidden.Length, "INFO")
@@ -2730,8 +3411,38 @@ RestoreOne(hwnd, announceWindow := false, *) {
     ; foreground/focus transition instead of a repeated SetFocus on an object
     ; NVDA may already consider focused.
     StartQuiet(SPEECH_SETTLE + 500)
-    bridgePrimed := PrimeBatchFocusBridge()
-    RevealBatchFast(e)
+    targetHung := WindowIsHung(e.hwnd)
+    if targetHung
+        DebugLog("Restore target is not responding; using async reveal only: hwnd=" hwnd, "WARN")
+    bridgePrimed := targetHung ? false : PrimeBatchFocusBridge()
+    revealed := RevealBatchFast(e)
+    if !revealed {
+        if IsObject(g_FocusBridgeGui)
+            try g_FocusBridgeGui.Hide()
+        stillHung := targetHung || WindowIsHung(e.hwnd)
+        pendingState := 0
+        if pendingRetry {
+            EndQuiet()
+        } else {
+            pendingState := QueuePendingRestore(e, announceWindow)
+            if (pendingState = 1) {
+                SayQuietFinal(stillHung
+                    ? "restore pending; window is not responding"
+                    : "restore pending; waiting for window")
+            } else if (pendingState = 2) {
+                SetTimer(EndQuiet, -700)
+            } else {
+                SayQuietFinal(stillHung
+                    ? "unable to restore; window is not responding"
+                    : "unable to restore window")
+            }
+        }
+        DebugLog("RestoreOne async reveal failed: hwnd=" hwnd
+            " hung=" stillHung
+            " pending=" (!pendingRetry && pendingState)
+            " elapsedMs=" (A_TickCount - startedAt), "WARN")
+        return false
+    }
     Forget(hwnd)
 
     ; Finish persistence/tray reflow *before* handing focus back to the app.
@@ -2748,13 +3459,25 @@ RestoreOne(hwnd, announceWindow := false, *) {
         DebugException("Native individual restore finalization failed", err)
     }
 
+    ; A target can become hung while its asynchronous show request is being
+    ; processed. Leave it visible, but do not attach input queues, activate it,
+    ; or restore a child focus while its owner thread is unresponsive.
+    targetHung := targetHung || WindowIsHung(e.hwnd)
+    if targetHung {
+        if IsObject(g_FocusBridgeGui)
+            try g_FocusBridgeGui.Hide()
+        SayQuietFinal("window restored but is not responding")
+        DebugLog("RestoreOne completed without focus handoff: hwnd=" hwnd
+            " bridgePrimed=" bridgePrimed " hung=1"
+            " elapsedMs=" (A_TickCount - startedAt), "WARN")
+        return true
+    }
+
     EndQuiet()
     SignalNativeNvdaRestore(e)
     Sleep NATIVE_RESTORE_HANDOFF_SETTLE
 
     activated := ActivateEntryBatchFast(e)
-    if (!activated)
-        activated := ForceForegroundWindow(e.hwnd, 0.06)
     if activated
         RememberUserForeground(e.hwnd)
     if IsObject(g_FocusBridgeGui)
@@ -2765,6 +3488,7 @@ RestoreOne(hwnd, announceWindow := false, *) {
         " activated=" activated
         " foreground=" DllCall("User32\GetForegroundWindow", "Ptr")
         " elapsedMs=" (A_TickCount - startedAt), "INFO")
+    return true
 }
 
 CloseOne(
@@ -2809,18 +3533,22 @@ RestoreGroup(proc, *) {
     }
 
     StartQuiet()
-    last := matches[matches.Length]
-    g_Restoring := true
-    for i, e in matches {
-        if (i = matches.Length)
-            continue
-        RevealBatchFast(e)
-    }
-    g_Restoring := false
-
     bridgePrimed := PrimeBatchFocusBridge()
-    RevealBatchFast(last)
-    ForgetProc(proc)
+    restored := []
+    g_Restoring := true
+    try {
+        for e in matches {
+            if RevealBatchFast(e) {
+                restored.Push(e)
+                Forget(e.hwnd)
+            } else {
+                QueuePendingRestore(e, true)
+            }
+        }
+    } finally {
+        g_Restoring := false
+    }
+
     try {
         SaveHidden()
         RefreshTray(true)
@@ -2828,12 +3556,34 @@ RestoreGroup(proc, *) {
         DebugException("Native group restore finalization failed", err)
     }
 
+    failedCount := matches.Length - restored.Length
+    if !restored.Length {
+        if IsObject(g_FocusBridgeGui)
+            try g_FocusBridgeGui.Hide()
+        SayQuietFinal("restore pending; windows are not responding")
+        DebugLog("RestoreGroup async reveal failed: app=" proc
+            " failed=" failedCount " remainingHidden=" g_Hidden.Length, "WARN")
+        return
+    }
+
+    last := restored[restored.Length]
+    if WindowIsHung(last.hwnd) {
+        if IsObject(g_FocusBridgeGui)
+            try g_FocusBridgeGui.Hide()
+        SayQuietFinal(failedCount
+            ? restored.Length " windows restored; " failedCount " pending"
+            : "windows restored; final window is not responding")
+        DebugLog("RestoreGroup completed without focus handoff: app=" proc
+            " restored=" restored.Length " failed=" failedCount, "WARN")
+        return
+    }
+
     EndQuiet()
-    SignalNativeNvdaRestore(last)
+    SignalNativeNvdaRestore(last, failedCount
+        ? restored.Length " windows restored; " failedCount " pending"
+        : "")
     Sleep NATIVE_RESTORE_HANDOFF_SETTLE
     activated := ActivateEntryBatchFast(last)
-    if (!activated)
-        activated := ForceForegroundWindow(last.hwnd, 0.06)
     if activated
         RememberUserForeground(last.hwnd)
     if IsObject(g_FocusBridgeGui)
@@ -2841,6 +3591,7 @@ RestoreGroup(proc, *) {
 
     DebugLog("RestoreGroup native handoff completed: app=" proc
         " remainingHidden=" g_Hidden.Length
+        " restored=" restored.Length " failed=" failedCount
         " bridgePrimed=" bridgePrimed
         " activated=" activated, "INFO")
 }
@@ -3005,34 +3756,56 @@ RestoreEverything(saySummary) {
 
     StartQuiet()
     entries := BuildRestoreAllOrder(g_Hidden.Clone())
-    n := entries.Length
-    last := n ? entries[n] : 0
+    bridgePrimed := PrimeBatchFocusBridge()
+    restored := []
 
-    ; Reveal every non-final window without activation so neither Windows nor
-    ; NVDA has to process a chain of intermediate foreground changes.
+    ; Every reveal is queued without activation. Entries that do not become
+    ; visible within the bounded wait stay tracked instead of disappearing from
+    ; the tray merely because their owner thread is hung.
     g_Restoring := true
-    for i, e in entries {
-        if (i = n)
-            continue
-        RevealBatchFast(e)
+    try {
+        for e in entries {
+            if RevealBatchFast(e) {
+                restored.Push(e)
+                Forget(e.hwnd)
+            } else {
+                QueuePendingRestore(e, true)
+            }
+        }
+    } finally {
+        g_Restoring := false
     }
-    g_Restoring := false
 
-    g_Hidden := []
-    bridgePrimed := false
-    if last {
-        ; Cross the hidden bridge, reveal the intended final foreground window
-        ; without activating it, then complete all MiniTray-owned tray/disk work
-        ; while NVDA is still quiet and the bridge still owns foreground.
-        bridgePrimed := PrimeBatchFocusBridge()
-        RevealBatchFast(last)
-    }
+    restoredCount := restored.Length
+    failedCount := entries.Length - restoredCount
+    last := restoredCount ? restored[restoredCount] : 0
 
     try {
         SaveHidden()
         RefreshTray(true)
     } catch Error as err {
         DebugException("Native restore-all finalization failed", err)
+    }
+
+    if !last {
+        if IsObject(g_FocusBridgeGui)
+            try g_FocusBridgeGui.Hide()
+        SayQuietFinal("restore pending; windows are not responding")
+        DebugLog("RestoreEverything async reveal failed: failed=" failedCount
+            " remainingHidden=" g_Hidden.Length
+            " elapsedMs=" (A_TickCount - startedAt), "WARN")
+        return
+    }
+
+    if WindowIsHung(last.hwnd) {
+        if IsObject(g_FocusBridgeGui)
+            try g_FocusBridgeGui.Hide()
+        SayQuietFinal(failedCount
+            ? restoredCount " windows restored; " failedCount " pending"
+            : "all windows restored; final window is not responding")
+        DebugLog("RestoreEverything completed without focus handoff: restored=" restoredCount
+            " failed=" failedCount " elapsedMs=" (A_TickCount - startedAt), "WARN")
+        return
     }
 
     if last {
@@ -3042,11 +3815,14 @@ RestoreEverything(saySummary) {
         ; Ctrl+Shift+L restores the entire stack. Let the NVDA plugin prepend
         ; this result to the same deterministic title/focus sequence so no
         ; separate utterance can be interrupted by the foreground transition.
-        SignalNativeNvdaRestore(last, saySummary ? "all windows restored" : "")
+        summary := ""
+        if saySummary
+            summary := (failedCount
+                ? restoredCount " windows restored; " failedCount " pending"
+                : "all windows restored")
+        SignalNativeNvdaRestore(last, summary)
         Sleep NATIVE_RESTORE_HANDOFF_SETTLE
         activated := ActivateEntryBatchFast(last)
-        if (!activated)
-            activated := ForceForegroundWindow(last.hwnd, 0.06)
         if activated
             RememberUserForeground(last.hwnd)
         if IsObject(g_FocusBridgeGui)
@@ -3060,7 +3836,8 @@ RestoreEverything(saySummary) {
         EndQuiet()
     }
 
-    DebugLog("RestoreEverything native handoff completed: restored=" n
+    DebugLog("RestoreEverything native handoff completed: restored=" restoredCount
+        " failed=" failedCount " remainingHidden=" g_Hidden.Length
         " foreground=" DllCall("User32\GetForegroundWindow", "Ptr")
         " elapsedMs=" (A_TickCount - startedAt), "INFO")
 }
@@ -3085,8 +3862,18 @@ RestoreLast(*) {
         SayQuietFinal("no windows hidden", 500)
         return
     }
-    ; Hotkey and tray restores intentionally share one activation path.
-    RestoreOne(g_Hidden[g_Hidden.Length].hwnd, true)
+
+    ; Ctrl+L follows the rendered tray order, not the incidental array tail.
+    ; This matters once the user has explicitly reordered windows/app groups.
+    ; If the first top-level item is an application group, restore the first
+    ; (topmost) window inside that group.
+    e := TopmostTrayWindow()
+    if !IsObject(e) {
+        StartQuiet(700)
+        SayQuietFinal("no windows hidden", 500)
+        return
+    }
+    RestoreOne(e.hwnd, true)
 }
 
 Prune() {
@@ -3230,10 +4017,9 @@ GroupByProcess() {
     groups.CaseSense := false
 
     ; Render the hidden-window stack newest-first. The underlying array remains
-    ; oldest-first so RestoreLast(), crash recovery, and restore-all activation
-    ; semantics stay unchanged. Walking backward makes the top tray item the
-    ; window/application most recently hidden, and also orders each app's
-    ; submenu with its newest hidden window first.
+    ; oldest-first for persistence and restore-all behavior. Explicit Move up /
+    ; Move down commands rewrite that stack so this rendered order becomes the
+    ; user's authoritative tray order.
     i := g_Hidden.Length
     while (i >= 1) {
         e := g_Hidden[i]
@@ -3245,6 +4031,125 @@ GroupByProcess() {
         i--
     }
     return { order: order, groups: groups }
+}
+
+TopmostTrayWindow() {
+    grp := GroupByProcess()
+    if !grp.order.Length
+        return 0
+    proc := grp.order[1]
+    if !grp.groups.Has(proc) || !grp.groups[proc].Length
+        return 0
+    return grp.groups[proc][1]
+}
+
+PopupProcessMoveAvailability(proc) {
+    grp := GroupByProcess()
+    pos := 0
+    for i, name in grp.order {
+        if (name = proc) {
+            pos := i
+            break
+        }
+    }
+    return { up: pos > 1, down: pos > 0 && pos < grp.order.Length }
+}
+
+PopupWindowMoveAvailability(hwnd, parentProc := "") {
+    global g_Hidden
+
+    ; A top-level single-window row occupies the same ordering slot as an app
+    ; group, so moving it means moving its process slot among top-level rows.
+    if (parentProc = "") {
+        if !(i := FindHidden(hwnd))
+            return { up: false, down: false }
+        return PopupProcessMoveAvailability(g_Hidden[i].proc)
+    }
+
+    grp := GroupByProcess()
+    if !grp.groups.Has(parentProc)
+        return { up: false, down: false }
+    entries := grp.groups[parentProc]
+    pos := 0
+    for i, e in entries {
+        if (e.hwnd = hwnd) {
+            pos := i
+            break
+        }
+    }
+    return { up: pos > 1, down: pos > 0 && pos < entries.Length }
+}
+
+MoveHiddenWindowWithinProcess(hwnd, proc, direction) {
+    global g_Hidden
+    grp := GroupByProcess()
+    if !grp.groups.Has(proc)
+        return false
+
+    entries := grp.groups[proc]
+    pos := 0
+    for i, e in entries {
+        if (e.hwnd = hwnd) {
+            pos := i
+            break
+        }
+    }
+    targetPos := pos + direction
+    if (!pos || targetPos < 1 || targetPos > entries.Length)
+        return false
+
+    a := FindHidden(entries[pos].hwnd)
+    b := FindHidden(entries[targetPos].hwnd)
+    if (!a || !b)
+        return false
+
+    tmp := g_Hidden[a]
+    g_Hidden[a] := g_Hidden[b]
+    g_Hidden[b] := tmp
+    SaveHidden()
+    DebugLog("Moved hidden window in tray order: hwnd=" hwnd " app=" proc
+        " direction=" direction " visibleFrom=" pos " visibleTo=" targetPos, "INFO")
+    return true
+}
+
+MoveHiddenProcessGroup(proc, direction) {
+    global g_Hidden
+    grp := GroupByProcess()
+    pos := 0
+    for i, name in grp.order {
+        if (name = proc) {
+            pos := i
+            break
+        }
+    }
+    targetPos := pos + direction
+    if (!pos || targetPos < 1 || targetPos > grp.order.Length)
+        return false
+
+    visibleOrder := grp.order.Clone()
+    tmpProc := visibleOrder[pos]
+    visibleOrder[pos] := visibleOrder[targetPos]
+    visibleOrder[targetPos] := tmpProc
+
+    ; Rebuild oldest-first from the desired newest-first rendered order. This
+    ; makes each app a stable block while preserving the existing order of the
+    ; windows inside every app group.
+    rebuilt := []
+    i := visibleOrder.Length
+    while (i >= 1) {
+        entries := grp.groups[visibleOrder[i]]
+        j := entries.Length
+        while (j >= 1) {
+            rebuilt.Push(entries[j])
+            j--
+        }
+        i--
+    }
+    g_Hidden := rebuilt
+    SaveHidden()
+    DebugLog("Moved hidden app in tray order: app=" proc " direction=" direction
+        " visibleFrom=" pos " visibleTo=" targetPos, "INFO")
+    return true
 }
 
 ; Speak once the dust has settled. Activating a window, restoring the focused
@@ -3720,6 +4625,8 @@ MenuLabel(title) {
 ;   Top level
 ;     - an app with exactly one hidden window is represented by that window title;
 ;     - an app with two or more hidden windows is represented as "<app> menu";
+;     - when two or more distinct apps are hidden, Restore all and Close all
+;       appear immediately above Settings;
 ;     - Settings is always the final row.
 ;   App context level
 ;     - hidden window titles, then Restore all and Close all.
@@ -3736,21 +4643,29 @@ MenuLabel(title) {
 ;   Left / Escape                   return one level (Escape closes at top)
 
 TrayIconMsg(wParam, lParam, msg, hwnd) {
+    global g_Hidden
     static WM_LBUTTONUP := 0x202
     static WM_LBUTTONDBLCLK := 0x203
     static WM_RBUTTONUP := 0x205
     static WM_RBUTTONDBLCLK := 0x206
+    static WM_CONTEXTMENU := 0x007B
+    static NIN_SELECT := 0x0400
+    static NIN_KEYSELECT := 0x0401
 
     ; With NOTIFYICON_VERSION_4 the icon ID may occupy the high word, so use
     ; only the low-word notification code.
     event := lParam & 0xFFFF
-    DebugLog("Tray icon notification: event=0x" Format("{:04X}", event), "DEBUG")
+    DebugLog("Tray icon notification: event=0x" Format("{:04X}", event)
+        " hiddenCount=" g_Hidden.Length, "DEBUG")
 
     ; Open the application list immediately. No double-click interval or
     ; accessibility-settle timer is allowed to delay the popup or its directly
     ; focused first-item announcement.
-    if (event = WM_RBUTTONUP) {
-        BeginTrayPopupOpen()
+    if (event = WM_RBUTTONUP || event = WM_CONTEXTMENU) {
+        if (g_Hidden.Length = 1)
+            BeginSingleWindowTrayMenu()
+        else
+            BeginTrayPopupOpen()
         return 0
     }
 
@@ -3760,8 +4675,13 @@ TrayIconMsg(wParam, lParam, msg, hwnd) {
     if (event = WM_RBUTTONDBLCLK)
         return 0
 
-    if (event = WM_LBUTTONUP || event = WM_LBUTTONDBLCLK)
-        BeginTrayPopupOpen()
+    if (event = WM_LBUTTONUP || event = WM_LBUTTONDBLCLK
+            || event = NIN_SELECT || event = NIN_KEYSELECT) {
+        if (g_Hidden.Length = 1)
+            RestoreLast()
+        else
+            BeginTrayPopupOpen()
+    }
     return 0                             ; suppress AHK's built-in tray menu
 }
 
@@ -3928,6 +4848,48 @@ BeginTrayPopupOpen(*) {
     ShowTrayPopup()
 }
 
+; With exactly one hidden window the notification icon represents that window,
+; not MiniTray. Its context gesture therefore opens a compact Restore, Close,
+; Settings menu. This is also the path used by the notification area's
+; Applications key / Shift+F10 WM_CONTEXTMENU message.
+BeginSingleWindowTrayMenu(*) {
+    global g_PopupGui, g_PopupLB, g_PopupItems, g_PopupOpening
+    global g_PopupProc, g_PopupMode, g_PopupContextHwnd, g_PopupContextParent
+    global g_Hidden
+    global POPUP_OPEN_SETTLE, POPUP_OPEN_TAIL
+
+    if (g_Hidden.Length != 1) {
+        BeginTrayPopupOpen()
+        return
+    }
+
+    DebugLog("Single-window tray menu requested", "INFO")
+    CapturePopupReturnFocus()
+    g_PopupOpening := true
+    StartQuiet(POPUP_OPEN_SETTLE + POPUP_OPEN_TAIL + 500, false)
+
+    if !g_PopupGui
+        BuildTrayPopup()
+    g_PopupProc := ""
+    g_PopupMode := "windowContext"
+    g_PopupContextHwnd := g_Hidden[1].hwnd
+    g_PopupContextParent := ""
+    FillTrayPopup(0)
+    if g_PopupItems.Length
+        g_PopupLB.Choose(1)
+
+    CoordMode "Mouse", "Screen"
+    MouseGetPos(&mx, &my)
+    g_PopupGui.Show("Hide AutoSize")
+    WinGetPos(, , &pw, &ph, "ahk_id " g_PopupGui.Hwnd)
+    b := GetBounds(g_PopupGui.Hwnd, "work")
+    x := Min(Max(mx - (pw // 2), b.l), b.r - pw)
+    y := Min(Max(my - ph, b.t), b.b - ph)
+    g_PopupGui.Show("x" x " y" y)
+    try g_PopupLB.Focus()
+    AnnounceTrayPopupOpened()
+}
+
 ShowTrayPopup(*) {
     global g_PopupGui, g_PopupLB, g_PopupItems, g_PopupProc, g_PopupMode, POPUP_OPEN_SETTLE
     global g_PopupContextHwnd, g_PopupContextParent
@@ -4077,13 +5039,16 @@ PopupEscape(*) {
 ; Rebuild the current level. selectIndex=0 suppresses the MTNAV transport;
 ; the initial-open path selects row 1 itself while the ListBox is still hidden.
 ;
-; Top level: single hidden windows or multi-window app menus, then Settings.
+; Top level: single hidden windows or multi-window app menus, then global
+; Restore all / Close all when more than one app is hidden, then Settings.
 ; There is no placeholder row when nothing is hidden, so Settings is then the
-; sole cyclic item. App context: windows, Restore all, Close all. Window context:
-; Restore, Close. Settings: Window rules, Options, Exit.
+; sole cyclic item. App context: windows, Restore all, Close all, then the
+; currently valid Move up / Move down commands. Window context: Restore, Close,
+; then the currently valid Move commands; the direct single-window tray context
+; adds Settings as its final command. Settings: Window rules, Options, Exit.
 FillTrayPopup(selectIndex := 1, selectProc := "", selectHwnd := 0) {
     global g_PopupLabel, g_PopupLB, g_PopupItems, g_PopupProc, g_PopupMode, APP_NAME
-    global g_PopupContextHwnd, g_PopupContextParent
+    global g_PopupContextHwnd, g_PopupContextParent, g_Hidden
     if !g_PopupLB
         return
 
@@ -4102,6 +5067,26 @@ FillTrayPopup(selectIndex := 1, selectProc := "", selectHwnd := 0) {
         rows.Push("Close")
         g_PopupItems.Push({ kind: "ctxCloseOne", proc: g_PopupContextParent
             , hwnd: g_PopupContextHwnd })
+
+        ; When the notification icon itself represents the sole hidden window,
+        ; its direct context menu is exactly Restore, Close, Settings. Nested
+        ; per-window contexts in multi-window mode keep their existing shape.
+        if (g_Hidden.Length = 1 && g_PopupContextParent = "") {
+            rows.Push("Settings")
+            g_PopupItems.Push({ kind: "settings", proc: "", hwnd: 0 })
+        }
+
+        move := PopupWindowMoveAvailability(g_PopupContextHwnd, g_PopupContextParent)
+        if move.up {
+            rows.Push("Move up")
+            g_PopupItems.Push({ kind: "ctxMoveOneUp", proc: g_PopupContextParent
+                , hwnd: g_PopupContextHwnd })
+        }
+        if move.down {
+            rows.Push("Move down")
+            g_PopupItems.Push({ kind: "ctxMoveOneDown", proc: g_PopupContextParent
+                , hwnd: g_PopupContextHwnd })
+        }
     } else if (g_PopupProc = "__settings__") {
         if g_PopupLabel
             g_PopupLabel.Text := "Settings"
@@ -4122,6 +5107,16 @@ FillTrayPopup(selectIndex := 1, selectProc := "", selectHwnd := 0) {
         g_PopupItems.Push({ kind: "restoreGroup", proc: g_PopupProc, hwnd: 0 })
         rows.Push("Close all")
         g_PopupItems.Push({ kind: "closeGroup", proc: g_PopupProc, hwnd: 0 })
+
+        move := PopupProcessMoveAvailability(g_PopupProc)
+        if move.up {
+            rows.Push("Move up")
+            g_PopupItems.Push({ kind: "moveGroupUp", proc: g_PopupProc, hwnd: 0 })
+        }
+        if move.down {
+            rows.Push("Move down")
+            g_PopupItems.Push({ kind: "moveGroupDown", proc: g_PopupProc, hwnd: 0 })
+        }
     } else {
         g_PopupProc := ""
         g_PopupMode := "browse"
@@ -4140,6 +5135,18 @@ FillTrayPopup(selectIndex := 1, selectProc := "", selectHwnd := 0) {
                 g_PopupItems.Push({ kind: "app", proc: proc, hwnd: 0 })
             }
         }
+
+        ; Global actions are useful only when hidden windows span more than
+        ; one distinct application group. Multiple hidden windows belonging
+        ; to the same app keep their Restore all / Close all actions inside
+        ; that app's context menu and do not add duplicate global actions.
+        if (grp.order.Length > 1) {
+            rows.Push("Restore all")
+            g_PopupItems.Push({ kind: "restoreAll", proc: "", hwnd: 0 })
+            rows.Push("Close all")
+            g_PopupItems.Push({ kind: "closeAll", proc: "", hwnd: 0 })
+        }
+
         rows.Push("Settings")
         g_PopupItems.Push({ kind: "settings", proc: "", hwnd: 0 })
     }
@@ -4297,6 +5304,114 @@ PopupThen(action, restoreFocusAfter := false, closeTargetHwnd := 0) {
     )
 }
 
+; When the tray popup contains the final hidden window, replay the exact global
+; configured restore command rather than calling RestoreOne from the ListBox callback path.
+; This deliberately makes the final tray restore look like the already-quiet
+; physical shortcut to Windows, AutoHotkey and NVDA. Before injecting the chord,
+; return foreground/control focus to the window that owned it before the popup.
+; SendLevel(1)+SendEvent allows the script-generated chord to trigger a level-0
+; hotkey; a short fallback calls RestoreLast directly if the injected event is
+; filtered by the local keyboard/input configuration.
+PopupReplayRestoreLastHotkey(targetHwnd, *) {
+    global g_Hidden, g_PopupReturnHwnd, g_PopupReturnCtrl, SPEECH_SETTLE
+
+    if (g_Hidden.Length != 1 || g_Hidden[1].hwnd != targetHwnd) {
+        PopupThen(RestoreOne.Bind(targetHwnd, true))
+        return
+    }
+
+    DebugLog("Final tray restore replaying configured shortcut: hwnd=" targetHwnd, "INFO")
+    StartQuiet(SPEECH_SETTLE + 900, false)
+    HideTrayPopup()
+
+    ; The physical restore shortcut starts outside the notification area. Recreate
+    ; that precondition before injecting the shortcut so shell focus is not the
+    ; source of the subsequent tray-icon removal event.
+    if IsPopupReturnWindow(g_PopupReturnHwnd) {
+        try ForceForegroundWindow(g_PopupReturnHwnd, 0.08)
+        if (g_PopupReturnCtrl
+                && DllCall("User32\IsWindow", "Ptr", g_PopupReturnCtrl))
+            try ForceControlFocus(g_PopupReturnHwnd, g_PopupReturnCtrl)
+    }
+
+    SetTimer(SendRestoreLastHotkey.Bind(targetHwnd), -45)
+}
+
+SendRestoreLastHotkey(targetHwnd, *) {
+    global g_Hidden, g_WindowShortcuts
+
+    if (g_Hidden.Length != 1 || g_Hidden[1].hwnd != targetHwnd)
+        return
+
+    shortcut := g_WindowShortcuts.Get("HotkeyRestore", "")
+    ; The popup must keep working when the global shortcut is disabled.
+    ; Never inject an old binding into the foreground application.
+    if (shortcut = "" || !WindowShortcutsEnabled()) {
+        RestoreLast()
+        return
+    }
+    RegExMatch(shortcut, "^([!^+#]*)(.+)$", &chord)
+    oldLevel := A_SendLevel
+    SendLevel(1)
+    try {
+        ; SendEvent is intentional: unlike SendInput, it can trigger this
+        ; script's own hotkey when the send level is above the hotkey's input
+        ; level. SendEvent presses/releases the configured modifiers.
+        SendEvent(chord[1] "{" chord[2] "}")
+    } catch Error as err {
+        DebugException("Synthetic restore shortcut replay failed", err)
+    } finally {
+        SendLevel(oldLevel)
+    }
+
+    ; Normally the shortcut has already removed the entry synchronously. If the
+    ; injected chord was filtered, run the same handler directly after focus has
+    ; already been returned to the pre-popup application.
+    SetTimer(VerifyRestoreLastHotkeyReplay.Bind(targetHwnd), -120)
+}
+
+VerifyRestoreLastHotkeyReplay(targetHwnd, *) {
+    global g_Hidden
+    if (g_Hidden.Length = 1 && g_Hidden[1].hwnd = targetHwnd) {
+        DebugLog("Synthetic restore shortcut was filtered; invoking RestoreLast fallback", "WARN")
+        RestoreLast()
+    }
+}
+
+; Final close has no equivalent global hotkey. Do not hand focus into the
+; notification area (the old MTCLOSETRAY path did exactly that). Instead restore
+; the pre-popup application first, then remove the now-empty tray icon while the
+; MiniTray quiet gate still owns any shell reflow events.
+FinalizeLastPopupClose(closeText, removeIcon, *) {
+    global g_PopupReturnHwnd, g_PopupReturnCtrl
+
+    StartQuiet(1800, false)
+    restored := false
+    if IsPopupReturnWindow(g_PopupReturnHwnd) {
+        restored := ForceForegroundWindow(g_PopupReturnHwnd, 0.08)
+        if (restored && g_PopupReturnCtrl
+                && DllCall("User32\IsWindow", "Ptr", g_PopupReturnCtrl))
+            ForceControlFocus(g_PopupReturnHwnd, g_PopupReturnCtrl)
+    }
+
+    ; Give the foreground/control focus event one message-loop slice to become
+    ; authoritative before Explorer removes/reflows the notification icon.
+    Sleep 35
+    if removeIcon
+        MTIcon_SetHidden(true, "popup final close after return-focus restore")
+
+    DebugLog("Final tray close returned focus before icon removal: restored="
+        restored " removeIcon=" removeIcon, "INFO")
+
+    if (closeText != "")
+        SayQuietFinal(closeText, 650)
+    else
+        EndQuiet()
+
+    g_PopupReturnHwnd := 0
+    g_PopupReturnCtrl := 0
+}
+
 
 PopupListMouseUp(wParam, lParam, msg, hwnd) {
     global g_PopupLB, g_PopupItems
@@ -4360,7 +5475,7 @@ PopupCloseKeepOpen(action, returnProc := "", preferredIndex := 1, *) {
     ; chosen. When no hidden windows remain, the plugin may advance to the next
     ; icon before posting WM_MT_HIDE_ICON back to this script.
     SetTimer(UpdateTrayIcon, 0)
-    A_IconTip := APP_NAME
+    MTIcon_RefreshIdentity()
     MTIcon_SetHidden(false, "popup close: keep icon until focus settles")
 
     if g_Hidden.Length {
@@ -4386,20 +5501,81 @@ PopupCloseKeepOpen(action, returnProc := "", preferredIndex := 1, *) {
         }
     }
 
-    ; No hidden item remains. Settings is not treated as a surviving close
-    ; context: close the popup and move into the native notification-area order.
+    ; No hidden item remains. The old path handed focus into the native
+    ; notification-area order and then removed our icon, which made Explorer
+    ; move accessibility focus to the neighboring tray icon. Keep the popup
+    ; quiet, hide it, restore the pre-popup application, and only then remove
+    ; the icon.
     HideTrayPopup()
     removeIcon := (g_Cfg.Get("HideIconWhenEmpty", "0") = "1")
-    SendCloseTrayResult(closeText, removeIcon)
-    DebugLog("Tray close handed off to notification-area focus: removeIcon="
+    SetTimer(FinalizeLastPopupClose.Bind(closeText, removeIcon), -1)
+    DebugLog("Tray final close scheduled return-focus finalization: removeIcon="
         removeIcon, "INFO")
 }
 
 
-; Enter/click restores the selected window or all windows for an app.
-; Shift+Enter or Shift+click closes the selected window or all app windows.
+PopupMoveContextWindow(direction, *) {
+    global g_PopupMode, g_PopupProc, g_PopupContextHwnd, g_PopupContextParent, g_Hidden
+
+    hwnd := g_PopupContextHwnd
+    parent := g_PopupContextParent
+    moved := false
+
+    if (parent != "") {
+        moved := MoveHiddenWindowWithinProcess(hwnd, parent, direction)
+    } else if (i := FindHidden(hwnd)) {
+        moved := MoveHiddenProcessGroup(g_Hidden[i].proc, direction)
+    }
+
+    if !moved
+        return
+
+    ; A Move command behaves like a native context-menu action: close the
+    ; context level and reveal the reordered parent with the moved item selected.
+    g_PopupMode := "browse"
+    g_PopupContextHwnd := 0
+    g_PopupContextParent := ""
+    g_PopupProc := parent
+    FillTrayPopup(1, parent, hwnd)
+}
+
+PopupMoveCurrentGroup(direction, *) {
+    global g_PopupProc, g_PopupMode
+    proc := g_PopupProc
+    if (proc = "" || proc = "__settings__")
+        return
+    if !MoveHiddenProcessGroup(proc, direction)
+        return
+
+    ; Group movement is visible at the top level, so return there and keep the
+    ; moved application selected in its new slot.
+    g_PopupMode := "browse"
+    g_PopupProc := ""
+    FillTrayPopup(1, proc)
+}
+
+PopupRestoreTopmostHotkey(*) {
+    global g_Hidden
+    e := TopmostTrayWindow()
+    if !IsObject(e) {
+        HideTrayPopup()
+        RestoreLast()
+        return
+    }
+
+    ; Preserve the special final-window focus handoff used by the popup. With
+    ; more than one hidden window, the ordinary deferred popup action is enough.
+    if (g_Hidden.Length = 1)
+        PopupReplayRestoreLastHotkey(e.hwnd)
+    else
+        PopupThen(RestoreOne.Bind(e.hwnd, true))
+}
+
+
+; Enter/click runs the selected action, including global Restore all / Close all.
+; Shift+Enter or Shift+click keeps the existing app/window close shortcuts.
 PopupActivate(shiftAction := false, *) {
-    global g_PopupLB, g_PopupProc, g_PopupContextParent
+    global g_PopupLB, g_PopupProc, g_PopupContextParent, g_Hidden
     EndQuiet()
     if !(it := PopupSelectedItem()) {
         DebugLog("PopupActivate ignored: no selected item", "DEBUG")
@@ -4437,6 +5613,8 @@ PopupActivate(shiftAction := false, *) {
                     ),
                     -1
                 )
+            else if (g_Hidden.Length = 1 && g_Hidden[1].hwnd = it.hwnd)
+                PopupReplayRestoreLastHotkey(it.hwnd)
             else
                 PopupThen(RestoreOne.Bind(it.hwnd, true))
         case "restoreGroup":
@@ -4445,6 +5623,17 @@ PopupActivate(shiftAction := false, *) {
             SetTimer(
                 PopupCloseKeepOpen.Bind(
                     CloseGroup.Bind(it.proc, false, false, true),
+                    "",
+                    selectedIndex
+                ),
+                -1
+            )
+        case "restoreAll":
+            PopupThen(RestoreAll)
+        case "closeAll":
+            SetTimer(
+                PopupCloseKeepOpen.Bind(
+                    CloseAllHidden.Bind(false, false, true),
                     "",
                     selectedIndex
                 ),
@@ -4459,7 +5648,10 @@ PopupActivate(shiftAction := false, *) {
         case "exit":
             QuitMiniTray()
         case "ctxRestoreOne":
-            PopupThen(RestoreOne.Bind(it.hwnd, true))
+            if (g_Hidden.Length = 1 && g_Hidden[1].hwnd = it.hwnd)
+                PopupReplayRestoreLastHotkey(it.hwnd)
+            else
+                PopupThen(RestoreOne.Bind(it.hwnd, true))
         case "ctxCloseOne":
             SetTimer(
                 PopupCloseKeepOpen.Bind(
@@ -4469,6 +5661,14 @@ PopupActivate(shiftAction := false, *) {
                 ),
                 -1
             )
+        case "ctxMoveOneUp":
+            PopupMoveContextWindow(-1)
+        case "ctxMoveOneDown":
+            PopupMoveContextWindow(1)
+        case "moveGroupUp":
+            PopupMoveCurrentGroup(-1)
+        case "moveGroupDown":
+            PopupMoveCurrentGroup(1)
         ; Backward-compatible action kinds retained for any stale popup rows.
         case "ctxRestoreGroup": PopupThen(RestoreGroup.Bind(it.proc))
         case "ctxCloseGroup":
@@ -4480,7 +5680,11 @@ PopupActivate(shiftAction := false, *) {
                 ),
                 -1
             )
-        case "ctxRestoreAll":   PopupThen(RestoreAll)
+        case "ctxRestoreAll":
+            if (g_Hidden.Length = 1)
+                PopupReplayRestoreLastHotkey(g_Hidden[1].hwnd)
+            else
+                PopupThen(RestoreAll)
         case "ctxCloseAll":
             SetTimer(
                 PopupCloseKeepOpen.Bind(
@@ -4625,7 +5829,7 @@ PopupOpenKeyboardContext(*) {
 RefreshTray(hideEmptyNow := false) {
     global g_Hidden, g_Cfg, APP_NAME, g_PopupGui, ICON_HIDE_DELAY
 
-    A_IconTip := APP_NAME                             ; constant, always
+    MTIcon_RefreshIdentity()
 
     ; Showing the icon is harmless at any moment. Hiding it makes Explorer
     ; reflow the notification area and can move accessibility focus to the next
@@ -4680,13 +5884,13 @@ BuildMainGui() {
     ; Title is just the app name. The settings folder used to be appended here
     ; to show which INI was live; the Options tab now has a labelled field for
     ; that, which is a better home for a long path than the title bar.
-    g := Gui("+Resize +MinSize900x520", APP_NAME)
+    g := Gui("+Resize +MinSize900x680", APP_NAME)
     g.SetFont("s10", "Segoe UI")
     g.MarginX := 12, g.MarginY := 12
     g.OnEvent("Close", (*) => g.Hide())
     g.OnEvent("Escape", (*) => g.Hide())
 
-    g_MainTab := g.Add("Tab3", "xm ym w880 h420", ["Rules", "Hidden windows", "Options"])
+    g_MainTab := g.Add("Tab3", "xm ym w880 h588", ["Rules", "Hidden windows", "Options"])
     tab := g_MainTab
 
     ; ---- Rules ----------------------------------------------------------
@@ -4739,11 +5943,27 @@ BuildMainGui() {
     g.Add("CheckBox", "x150 y+8 vOptAuto", "Apply rules automatically on focus and title change")
     g.Add("CheckBox", "x150 y+8 vOptHideIcon"
         , "Remove the tray icon when nothing is hidden (a screen reader may re-read the tray)")
-    ; A compiled exe reads its INI from its OWN folder, so running the build
-    ; and running the source use two different files. Show which one is live.
-    g.Add("Text", "x28 y+22 w120", "Settings file")
+    g.Add("GroupBox", "x28 y276 w824 h226", "Keyboard shortcuts")
+    g.Add("Text", "x44 y300 w790 h34"
+        , "Choose Learn, then press your new shortcut. Escape cancels learning.`n"
+        . "Use Clear to disable a shortcut. Changes apply when you save.")
+    shortcutY := 342
+    for index, spec in WindowShortcutSpecs() {
+        g.Add("Text", "x44 y" (shortcutY + 4) " w274", spec.label " shortcut")
+        g.Add("Edit", "x328 y" shortcutY " w190 ReadOnly v" spec.control)
+        b := g.Add("Button", "x526 y" shortcutY " w148 v" spec.control "Learn"
+            , "Learn " spec.shortLabel " (&" index ")")
+        b.OnEvent("Click", BeginWindowShortcutLearning.Bind(spec))
+        b := g.Add("Button", "x682 y" shortcutY " w156", "Clear " spec.shortLabel)
+        b.OnEvent("Click", ClearWindowShortcutOption.Bind(spec))
+        shortcutY += 30
+    }
+    b := g.Add("Button", "x328 y466 w200", "Reset shortcut &defaults")
+    b.OnEvent("Click", ResetWindowShortcutOptions)
+    ; Both the compiled program and the script use this per-user INI.
+    g.Add("Text", "x28 y520 w120", "Settings file")
     g.Add("Edit", "x150 yp-4 w500 ReadOnly vOptIniPath", INI_FILE)
-    b := g.Add("Button", "x150 y+20 w120", "Save options")
+    b := g.Add("Button", "x150 y+14 w140", "&Save options")
     b.OnEvent("Click", (*) => SaveOptionsFromGui())
 
     tab.UseTab()
@@ -4883,10 +6103,12 @@ LoadOptionsIntoGui() {
     g_MainGui["OptConfirm"].Value := (g_Cfg.Get("ConfirmCloseAll", "1") = "1")
     g_MainGui["OptAuto"].Value    := (g_Cfg.Get("AutoApply", "1") = "1")
     g_MainGui["OptHideIcon"].Value := (g_Cfg.Get("HideIconWhenEmpty", "0") = "1")
+    for spec in WindowShortcutSpecs()
+        g_MainGui[spec.control].Value := WindowShortcutText(g_Cfg.Get(spec.key, ""))
 }
 
 SaveOptionsFromGui() {
-    global g_MainGui, g_Cfg, g_Hidden, INI_FILE, CFG_SEC
+    global g_MainGui, g_Cfg, g_Hidden, INI_FILE, CFG_SEC, g_WindowShortcuts, APP_NAME
     if !g_MainGui
         return
     set := Map("SoundMode",       g_MainGui["OptSound"].Text
@@ -4897,9 +6119,37 @@ SaveOptionsFromGui() {
              , "ConfirmCloseAll", g_MainGui["OptConfirm"].Value ? "1" : "0"
              , "AutoApply",       g_MainGui["OptAuto"].Value ? "1" : "0"
              , "HideIconWhenEmpty", g_MainGui["OptHideIcon"].Value ? "1" : "0")
-    for k, v in set {
-        IniWrite(v, INI_FILE, CFG_SEC, k)
-        g_Cfg[k] := v . ""
+    requested := Map()
+    for spec in WindowShortcutSpecs()
+        requested[spec.key] := g_MainGui[spec.control].Value
+    previous := g_WindowShortcuts.Clone()
+    shortcutsApplied := false
+    try {
+        bindings := ValidateWindowShortcuts(requested)
+        nextCfg := g_Cfg.Clone()
+        for k, v in set
+            nextCfg[k] := v . ""
+        for k, v in bindings
+            nextCfg[k] := v
+        ApplyWindowShortcuts(bindings)
+        shortcutsApplied := true
+        ; Replace only the configuration section in one write. Preserve
+        ; unknown settings, window rules and the hidden-window recovery record.
+        section := ""
+        for k, v in nextCfg
+            section .= k "=" v "`n"
+        IniWrite(RTrim(section, "`n"), INI_FILE, CFG_SEC)
+        g_Cfg := nextCfg
+    } catch Error as err {
+        if shortcutsApplied {
+            try ApplyWindowShortcuts(previous)
+            catch Error as restoreError
+                DebugException("Unable to roll back window shortcuts", restoreError)
+        }
+        DebugException("Options were not saved", err)
+        MsgBox("Options could not be saved.`n`n" err.Message
+            , APP_NAME, "Icon! Owner" g_MainGui.Hwnd)
+        return
     }
 
     ; Save is also the Options dialog's accept action. If the new setting hides
@@ -5335,7 +6585,7 @@ CloseEditGui() {
 }
 
 QuitMiniTray(*) {
-    global g_Cfg
+    global g_Cfg, g_Hidden
     DebugLog("Quit requested by user", "INFO")
 
     ; Restore every tracked window before announcing or terminating. The batch
@@ -5343,8 +6593,15 @@ QuitMiniTray(*) {
     ; AutoHotkey's per-window WinShow/WinRestore delays or generating a cascade
     ; of foreground announcements.
     restoredCount := RestoreAllForExit()
+    remainingCount := g_Hidden.Length
     noun := (restoredCount = 1) ? " window" : " windows"
-    message := restoredCount noun " restored, exited MiniTray"
+    if remainingCount {
+        remainingNoun := (remainingCount = 1) ? " window" : " windows"
+        message := restoredCount noun " restored, " remainingCount remainingNoun
+            . " still hidden, exited MiniTray"
+    } else {
+        message := restoredCount noun " restored, exited MiniTray"
+    }
 
     ; Quit is an explicit user command, so report it even when routine MiniTray
     ; speech is disabled. Keep focus and shell churn quiet while the tray popup
@@ -5363,30 +6620,32 @@ QuitMiniTray(*) {
 }
 
 RestoreAllForExit() {
-    global g_Hidden, g_Restoring, INI_FILE, HID_SEC
+    global g_Hidden, g_Restoring
 
     entries := BuildRestoreAllOrder(g_Hidden.Clone())
     restoredCount := 0
     g_Restoring := true
     try {
         for e in entries {
-            if !WindowMatchesRecord(e)
+            if !WindowMatchesRecord(e) {
+                Forget(e.hwnd)
                 continue
-            if RevealBatchFast(e)
+            }
+            if RevealBatchFast(e) {
                 restoredCount++
+                Forget(e.hwnd)
+            }
         }
     } finally {
         g_Restoring := false
     }
 
-    ; Clear the authoritative in-memory and persisted lists now. HandleExit()
-    ; remains as a crash/reload safety net, but has nothing to restore twice
-    ; after an ordinary user-requested quit.
-    g_Hidden := []
-    try IniDelete(INI_FILE, HID_SEC)
+    ; Preserve any hide-backed entry whose unresponsive owner did not process
+    ; the async reveal. A later MiniTray start can safely adopt and retry it.
+    SaveHidden()
 
     DebugLog("Exit restore completed: restored=" restoredCount
-        " tracked=" entries.Length, "INFO")
+        " failed=" g_Hidden.Length " tracked=" entries.Length, "INFO")
     return restoredCount
 }
 
@@ -5398,24 +6657,28 @@ RestoreAllForExit() {
 ; net for reloads, replacement by #SingleInstance Force, shutdown, and other
 ; clean-exit paths.
 HandleExit(reason, code) {
-    global g_Hidden, INI_FILE, HID_SEC, g_FocusBridgeGui
+    global g_Hidden, g_FocusBridgeGui
     DebugLog("HandleExit: reason=" reason " code=" code " hidden=" g_Hidden.Length, "INFO")
     RemoveHooks()
     if IsObject(g_FocusBridgeGui)
         try g_FocusBridgeGui.Destroy()
     for e in g_Hidden.Clone() {
         try {
-            if !WindowMatchesRecord(e)
+            if !WindowMatchesRecord(e) {
+                Forget(e.hwnd)
                 continue
-            if (e.how = "min")
-                TaskbarTab(e.hwnd, true)
-            WinShow("ahk_id " e.hwnd)
+            }
+            RequestEntryRevealAsync(e)
+            ; A minimize-backed item is reachable again as soon as its taskbar
+            ; tab is restored. A hide-backed item is forgotten only after the
+            ; owner actually processes the async show request.
+            if (e.how = "min" || DllCall("User32\IsWindowVisible", "Ptr", e.hwnd))
+                Forget(e.hwnd)
         } catch {
             ; window already gone; nothing to un-hide
         }
     }
-    g_Hidden := []
-    try IniDelete(INI_FILE, HID_SEC)
+    SaveHidden()
 
     ; Do not send Shell_NotifyIcon(NIM_DELETE) during shutdown. Explorer has
     ; repeatedly fail-fasted while servicing DeleteIcon/NotificationAreaIcon2::Close.
@@ -5466,6 +6729,13 @@ MTIcon_State() {
     static s := ""
     if !IsObject(s) {
         s := { hIcon:   0
+             , hBaseIcon: 0
+             , hWindowIcon: 0
+             , iconHwnd: 0
+             , tip: ""
+             , identityCount: -1
+             , rebindPending: false
+             , rebindWhy: ""
              , added:   false
              , hidden:  false
              , hooked:  false
@@ -5543,6 +6813,12 @@ MTIcon_BuildNid(flags, state := 0, stateMask := 0, tip := "") {
     if !IsObject(st.buf)
         st.buf := Buffer(o.size, 0)
 
+    ; The buffer is reused to avoid allocation churn, but every Shell call must
+    ; receive a freshly zero-initialized NOTIFYICONDATA. In particular, never
+    ; let an earlier szTip/uVersion union or balloon field leak into a later
+    ; NIM_MODIFY and become additional XAML accessibility text.
+    DllCall("RtlZeroMemory", "Ptr", st.buf.Ptr, "UPtr", o.size)
+
     NumPut("UInt", o.size,       st.buf, o.cbSize)
     NumPut("Ptr",  A_ScriptHwnd, st.buf, o.hWnd)
     NumPut("UInt", st.uID,       st.buf, o.uID)
@@ -5552,10 +6828,8 @@ MTIcon_BuildNid(flags, state := 0, stateMask := 0, tip := "") {
     NumPut("UInt", state,        st.buf, o.dwState)
     NumPut("UInt", stateMask,    st.buf, o.dwStateMask)
 
-    if (tip != "") {
-        DllCall("RtlZeroMemory", "Ptr", st.buf.Ptr + o.szTip, "UPtr", 256)
-        StrPut(SubStr(tip, 1, 127), st.buf.Ptr + o.szTip, 127, "UTF-16")
-    }
+    if (tip != "")
+        StrPut(SubStr(tip, 1, 127), st.buf.Ptr + o.szTip, 128, "UTF-16")
     return st.buf
 }
 
@@ -5586,6 +6860,243 @@ MTIcon_Load() {
     return DllCall("LoadIconW", "Ptr", 0, "Ptr", 32512, "Ptr")        ; IDI_APPLICATION
 }
 
+; Return a private icon handle for a hidden window. WM_GETICON covers windows
+; with a per-window icon; the class fallbacks cover ordinary Win32 apps. CopyIcon
+; is essential because the source handle remains owned by the target process.
+MTIcon_CopyWindowIcon(hwnd) {
+    static WM_GETICON := 0x007F
+    static ICON_SMALL2 := 2, ICON_SMALL := 0, ICON_BIG := 1
+    static GCLP_HICON := -14, GCLP_HICONSM := -34
+
+    if (!hwnd || !DllCall("User32\IsWindow", "Ptr", hwnd))
+        return 0
+
+    source := 0
+    for iconType in [ICON_SMALL2, ICON_SMALL, ICON_BIG] {
+        result := 0
+        sent := DllCall("User32\SendMessageTimeoutW"
+            , "Ptr", hwnd, "UInt", WM_GETICON, "Ptr", iconType, "Ptr", 0
+            , "UInt", 0x2, "UInt", 80, "Ptr*", &result, "Ptr")
+        source := sent ? result : 0
+        if source
+            break
+    }
+    if !source {
+        fn := (A_PtrSize = 8) ? "User32\GetClassLongPtrW" : "User32\GetClassLongW"
+        source := DllCall(fn, "Ptr", hwnd, "Int", GCLP_HICONSM, "Ptr")
+        if !source
+            source := DllCall(fn, "Ptr", hwnd, "Int", GCLP_HICON, "Ptr")
+    }
+    return source ? DllCall("User32\CopyIcon", "Ptr", source, "Ptr") : 0
+}
+
+; Select the image that corresponds to the current tray identity. The sole
+; hidden window supplies its own icon; every other state uses MiniTray's icon.
+; Existing private window-icon handles are destroyed only after Explorer has
+; accepted the replacement, so a failed NIM_MODIFY cannot leave a dangling icon.
+MTIcon_RefreshImage() {
+    global g_Hidden
+    st := MTIcon_State()
+
+    if !st.hBaseIcon
+        st.hBaseIcon := MTIcon_Load()
+
+    targetHwnd := (g_Hidden.Length = 1) ? g_Hidden[1].hwnd : 0
+    if (targetHwnd = st.iconHwnd && st.hIcon)
+        return true
+
+    newWindowIcon := targetHwnd ? MTIcon_CopyWindowIcon(targetHwnd) : 0
+    newIcon := newWindowIcon ? newWindowIcon : st.hBaseIcon
+    oldWindowIcon := st.hWindowIcon
+    oldIcon := st.hIcon
+
+    st.hIcon := newIcon
+    if st.added {
+        nid := MTIcon_BuildNid(0x2) ; NIF_ICON
+        ok := DllCall("shell32\Shell_NotifyIconW", "UInt", 1, "Ptr", nid, "Int")
+        MTIcon_Log("NIM_MODIFY ICON", ok
+            , targetHwnd ? "single hidden hwnd=" targetHwnd : "MiniTray identity")
+        if !ok {
+            st.hIcon := oldIcon
+            if newWindowIcon
+                DllCall("User32\DestroyIcon", "Ptr", newWindowIcon)
+            return false
+        }
+    }
+
+    st.hWindowIcon := newWindowIcon
+    st.iconHwnd := newWindowIcon ? targetHwnd : 0
+    if oldWindowIcon
+        DllCall("User32\DestroyIcon", "Ptr", oldWindowIcon)
+    return true
+}
+
+; Change icon image and accessible title in one NIM_MODIFY. This matters at the
+; one-to-two boundary: Explorer must never observe the first window's image with
+; MiniTray's title, or MiniTray's image with the first window's title. Exactly
+; one hidden window owns the identity; every other count uses MiniTray.
+MTIcon_RefreshIdentity() {
+    global g_Hidden, APP_NAME
+    st := MTIcon_State()
+
+    if !st.hBaseIcon
+        st.hBaseIcon := MTIcon_Load()
+
+    single := (g_Hidden.Length = 1)
+    targetHwnd := single ? g_Hidden[1].hwnd : 0
+    multiTip := (g_Hidden.Length >= 2) ? (
+        APP_NAME ", (" g_Hidden.Length " hidden windows)"
+    ) : APP_NAME
+    targetTip := SubStr(single ? g_Hidden[1].title : multiTip, 1, 127)
+
+    ; Reuse the current private window icon when only its live title changed.
+    ; Otherwise acquire the new sole window's icon, or select MiniTray's base
+    ; icon immediately when the hidden count becomes zero or two-plus.
+    sameWindow := (targetHwnd && targetHwnd = st.iconHwnd && st.hWindowIcon)
+    newWindowIcon := sameWindow ? st.hWindowIcon : (
+        targetHwnd ? MTIcon_CopyWindowIcon(targetHwnd) : 0
+    )
+    newIcon := newWindowIcon ? newWindowIcon : st.hBaseIcon
+
+    if (st.hIcon = newIcon && st.tip = targetTip
+            && ((!targetHwnd && !st.iconHwnd) || targetHwnd = st.iconHwnd))
+        return true
+
+    oldIcon := st.hIcon
+    oldWindowIcon := st.hWindowIcon
+    oldIconHwnd := st.iconHwnd
+    oldTip := st.tip
+    oldIdentityCount := st.identityCount
+    st.hIcon := newIcon
+
+    if st.added {
+        ; Send exactly one title-bearing update. Windows 11 can coalesce an
+        ; empty-tip update immediately followed by a non-empty update and expose
+        ; both the cached and current strings as one UIA name. The hide/show
+        ; rebind below is the cache boundary; a preliminary empty title is not.
+        ; NIF_ICON | NIF_TIP | NIF_SHOWTIP
+        nid := MTIcon_BuildNid(0x2 | 0x4 | 0x80, 0, 0, targetTip)
+        ok := DllCall("shell32\Shell_NotifyIconW", "UInt", 1, "Ptr", nid, "Int")
+        MTIcon_Log("NIM_MODIFY IDENTITY", ok
+            , single ? "single hidden hwnd=" targetHwnd : "MiniTray count=" g_Hidden.Length)
+
+        ; Some Windows 11 Shell builds reject a combined image/title mutation
+        ; during the one-to-many identity boundary. Retry the two fields
+        ; independently so the MiniTray image cannot remain blocked behind a
+        ; tooltip-provider quirk.
+        if (!ok && !single) {
+            iconNid := MTIcon_BuildNid(0x2) ; NIF_ICON
+            iconOk := DllCall("shell32\Shell_NotifyIconW"
+                , "UInt", 1, "Ptr", iconNid, "Int")
+            MTIcon_Log("NIM_MODIFY FORCE MINITRAY ICON", iconOk
+                , "fallback after combined identity update failed")
+
+            tipNid := MTIcon_BuildNid(0x4 | 0x80, 0, 0, targetTip)
+            tipOk := DllCall("shell32\Shell_NotifyIconW"
+                , "UInt", 1, "Ptr", tipNid, "Int")
+            MTIcon_Log("NIM_MODIFY FORCE MINITRAY TIP", tipOk
+                , "fallback after combined identity update failed")
+            ok := iconOk && tipOk
+        }
+        if !ok {
+            st.hIcon := oldIcon
+            st.hWindowIcon := oldWindowIcon
+            st.iconHwnd := oldIconHwnd
+            st.tip := oldTip
+            st.identityCount := oldIdentityCount
+            ; Best-effort restoration keeps the previous Shell identity usable.
+            recoveryNid := MTIcon_BuildNid(0x2 | 0x4 | 0x80, 0, 0, oldTip)
+            recoveryOk := DllCall("shell32\Shell_NotifyIconW"
+                , "UInt", 1, "Ptr", recoveryNid, "Int")
+            MTIcon_Log("NIM_MODIFY IDENTITY RECOVERY", recoveryOk
+                , "restore previous identity after replacement failure")
+            if (newWindowIcon && newWindowIcon != oldWindowIcon)
+                DllCall("User32\DestroyIcon", "Ptr", newWindowIcon)
+            return false
+        }
+    }
+
+    st.hWindowIcon := newWindowIcon
+    st.iconHwnd := newWindowIcon ? targetHwnd : 0
+    st.tip := targetTip
+    st.identityCount := g_Hidden.Length
+    if (oldWindowIcon && oldWindowIcon != newWindowIcon)
+        DllCall("User32\DestroyIcon", "Ptr", oldWindowIcon)
+
+    ; Shell accepted the replacement, but Windows 11's XAML tray surface can
+    ; retain the previous UIA name and append the new title to it. Every visible
+    ; identity-name change therefore gets a real accessibility-object boundary:
+    ; briefly hide this same registration, then show it again. This also covers
+    ; the one-to-two icon transition, without entering the crash-prone
+    ; NIM_DELETE path.
+    if (st.added && g_Hidden.Length >= 1 && oldTip != targetTip)
+        MTIcon_BeginIdentityRebind(single
+            ? "single hidden title replacement"
+            : "hidden-window count identity replacement")
+    return true
+}
+
+MTIcon_BeginIdentityRebind(why := "tray identity replacement") {
+    st := MTIcon_State()
+    if st.rebindPending {
+        st.rebindWhy := why
+        return true
+    }
+
+    st.rebindPending := true
+    st.rebindWhy := why
+    if !MTIcon_SetHidden(true, why ": hide XAML tray identity") {
+        st.rebindPending := false
+        st.rebindWhy := ""
+        return false
+    }
+    SetTimer(MTIcon_FinishIdentityRebind, -80)
+    DebugLog("Scheduled XAML tray identity rebind completion: " why, "INFO")
+    return true
+}
+
+MTIcon_FinishIdentityRebind(*) {
+    st := MTIcon_State()
+    if !st.rebindPending
+        return
+    why := st.rebindWhy ? st.rebindWhy : "tray identity replacement"
+    st.rebindPending := false
+    st.rebindWhy := ""
+    MTIcon_SetHidden(false, why ": show rebound XAML tray identity")
+}
+
+MTIcon_SetTip(tip) {
+    st := MTIcon_State()
+    tip := SubStr(tip, 1, 127)
+    if (st.tip = tip)
+        return true
+    if !st.added {
+        st.tip := tip
+        return true
+    }
+
+    oldTip := st.tip
+    clearNid := MTIcon_BuildNid(0x4 | 0x80, 0, 0, "")
+    clearOk := DllCall("shell32\Shell_NotifyIconW", "UInt", 1, "Ptr", clearNid, "Int")
+    MTIcon_Log("NIM_MODIFY TIP CLEAR", clearOk
+        , "invalidate old accessible title before tip-only replacement")
+    if !clearOk
+        return false
+    st.tip := ""
+
+    nid := MTIcon_BuildNid(0x4 | 0x80, 0, 0, tip) ; NIF_TIP | NIF_SHOWTIP
+    ok := DllCall("shell32\Shell_NotifyIconW", "UInt", 1, "Ptr", nid, "Int")
+    if ok
+        st.tip := tip
+    else {
+        recoveryNid := MTIcon_BuildNid(0x4 | 0x80, 0, 0, oldTip)
+        if DllCall("shell32\Shell_NotifyIconW", "UInt", 1, "Ptr", recoveryNid, "Int")
+            st.tip := oldTip
+    }
+    MTIcon_Log("NIM_MODIFY TIP", ok, "identity tooltip refresh")
+    return ok
+}
+
 MTIcon_Init() {
     st := MTIcon_State()
 
@@ -5598,20 +7109,43 @@ MTIcon_Init() {
     return MTIcon_Add()
 }
 
+MTIcon_SetVersion4() {
+    st := MTIcon_State()
+    o := MTIcon_Offsets()
+    nid := MTIcon_BuildNid(0)
+    NumPut("UInt", 4, nid, o.uVersion) ; NOTIFYICON_VERSION_4
+    ok := DllCall("shell32\Shell_NotifyIconW", "UInt", 4, "Ptr", nid, "Int")
+    MTIcon_Log("NIM_SETVERSION 4", ok, "required after every NIM_ADD")
+    return ok
+}
+
 MTIcon_Add() {
     st := MTIcon_State()
     if st.added
         return true
 
+    if !st.hBaseIcon
+        st.hBaseIcon := MTIcon_Load()
     if !st.hIcon
-        st.hIcon := MTIcon_Load()
+        st.hIcon := st.hBaseIcon
+    MTIcon_RefreshIdentity()
 
-    ; NIF_MESSAGE | NIF_ICON | NIF_TIP
-    nid := MTIcon_BuildNid(0x1 | 0x2 | 0x4, 0, 0, APP_NAME)
+    ; NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP. Version 4 otherwise
+    ; suppresses the standard tooltip, which is also the tray button's accessible
+    ; name on Windows 11.
+    tip := st.tip ? st.tip : APP_NAME
+    nid := MTIcon_BuildNid(0x1 | 0x2 | 0x4 | 0x80, 0, 0, tip)
     ok  := DllCall("shell32\Shell_NotifyIconW", "UInt", 0, "Ptr", nid, "Int")  ; NIM_ADD
 
     st.added  := ok ? true : false
     st.hidden := false
+    if ok {
+        st.tip := tip
+        ; Microsoft requires NIM_SETVERSION after each NIM_ADD. Without it the
+        ; legacy notification record and Windows 11 XAML accessibility bridge
+        ; can retain the prior tooltip as a second name fragment.
+        MTIcon_SetVersion4()
+    }
 
     MTIcon_Log("NIM_ADD", ok)
     return ok
@@ -5627,6 +7161,14 @@ MTIcon_SetHidden(hide, why := "") {
         DebugLog("MTIcon SetHidden(" hide ") while not registered; adding first", "DEBUG")
         if !MTIcon_Add()
             return false
+    }
+    ; RefreshTray runs immediately after the identity mutation. Do not let its
+    ; ordinary show request collapse the intentional 80 ms rebind interval into
+    ; the same message-loop slice; the XAML surface needs to observe the hidden
+    ; state before it can recreate the button with MiniTray's identity.
+    if (!hide && st.rebindPending) {
+        MTIcon_Log("VISIBLE DEFERRED", 1, why " (identity rebind pending)")
+        return true
     }
     if (st.hidden = hide)
         return true

@@ -695,7 +695,17 @@ TypeAheadCore(ch) {
     ; pinned grid, the recommended list, or the main app list. Only the app list
     ; needs pinned/recommended filtered out (they're nested inside it).
     excl := false
-    if InListById(focused, ["StartFolderModal"])
+    ; A folder modal EXISTS only while a folder is open, so its presence is a far
+    ; more reliable signal than the focused element -- which, just after the
+    ; folder opens, can still report the app-list row it was on. When that stale
+    ; reading won, type-ahead searched the whole app list instead of the folder:
+    ; the "leak outside the folder".
+    modal := GetFolderModal()
+    if IsObject(modal) {
+        list := modal
+        Log("  scope: folder modal")
+    }
+    else if InListById(focused, ["StartFolderModal"])
         list := NearestListAncestor(focused)
     else if InListById(focused, ["PinnedList"])
         list := GetListById("PinnedList")
